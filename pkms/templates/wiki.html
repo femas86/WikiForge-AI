@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Wiki — {{ project }}{% endblock %}
+{% block heading %}Wiki{% endblock %}
+{% block subheading %}Compiled knowledge · project {{ project }}{% endblock %}
+
+{% block content %}
+<div class="card">
+  <form method="get" action="/wiki" style="display:flex;gap:10px;align-items:flex-end">
+    <div class="field" style="max-width:260px;margin-bottom:0">
+      <label for="project">Project</label>
+      <select id="project" name="project" onchange="this.form.submit()">
+        {% for p in projects %}<option value="{{ p }}"{% if p == project %} selected{% endif %}>{{ p }}</option>{% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="btn btn-primary">Browse</button>
+    <a href="/wiki/graph?project={{ project }}" class="btn btn-secondary">🕸 Graph view</a>
+  </form>
+</div>
+
+{% if all_tags %}
+<div class="card">
+  <div class="card-title">Filter by tag</div>
+  <div class="wiki-tags">
+    {% for t in all_tags %}
+    <a href="/wiki?project={{ project }}&tag={{ t }}" class="tag"
+       style="{% if t == active_tag %}background:var(--accent);color:#fff{% endif %}">{{ t }}</a>
+    {% endfor %}
+    {% if active_tag %}
+    <a href="/wiki?project={{ project }}" class="hint" style="margin-left:8px">✕ clear filter</a>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-title">Articles ({{ articles | length }}){% if active_tag %} · tag: {{ active_tag }}{% endif %}</div>
+  {% if articles %}
+  <ul class="wiki-list">
+    {% for a in articles %}
+    <li class="wiki-item">
+      <a href="/wiki/{{ project }}/{{ a.slug }}" class="wiki-link-title">{{ a.title }}</a>
+      {% if a.summary %}<p class="hint">{{ a.summary }}</p>{% endif %}
+      {% if a.tags %}
+      <span class="wiki-tags">
+        {% for t in a.tags %}<span class="tag">{{ t }}</span>{% endfor %}
+      </span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="hint">No compiled articles in this project yet. Ingest a document — auto-compile will create the first article.</p>
+  {% endif %}
+</div>
+
+{% if pending %}
+<div class="card">
+  <div class="card-title">Not yet compiled ({{ pending | length }})</div>
+  <p class="hint">Raw documents ingested but without a wiki article. Run <code>pkms compile --project {{ project }}</code> or wait for auto-compile.</p>
+  <ul class="wiki-list">
+    {% for p in pending %}
+    <li class="wiki-item"><code>{{ p }}</code></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endblock %}

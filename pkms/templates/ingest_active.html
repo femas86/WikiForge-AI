@@ -1,0 +1,18 @@
+{% if jobs %}
+<div class="card">
+  <div class="card-title">In progress ({{ jobs | length }})</div>
+  <p class="hint" style="margin-bottom:10px">
+    Ingests run one at a time (Ollama is shared/CPU-bound); extra ones wait in a queue.
+  </p>
+  {% for j in jobs %}
+    <div style="margin-bottom:6px">
+      <span class="badge badge-{{ 'partial' if j.status == 'queued' else 'full' }}">
+        {{ '⏳ queued' if j.status == 'queued' else '⚙ running' }}
+      </span>
+    </div>
+    {% with job_id = j.job_id, target = j.target %}
+      {% include "ingest_stream.html" %}
+    {% endwith %}
+  {% endfor %}
+</div>
+{% endif %}

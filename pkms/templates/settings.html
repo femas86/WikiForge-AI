@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block heading %}Settings{% endblock %}
+{% block subheading %}Personal answer style · applies only to your query answers{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-title">Answer style</div>
+  <p class="hint" style="margin-bottom:16px">
+    These instructions tune how the assistant <strong>formats answers for you</strong>
+    (tone, language, structure). They never change the shared wiki — that's governed
+    per project by <code>vault/&lt;project&gt;/CLAUDE.md</code>.
+  </p>
+
+  <form hx-post="/ui/settings"
+        hx-target="#settings-result"
+        hx-swap="innerHTML"
+        hx-disabled-elt="button[type=submit]">
+
+    <div class="field" style="max-width:260px">
+      <label for="user-select">Your name / ID</label>
+      {% if users %}
+      <select id="user-select" name="user_id" onchange="onUserSelect()">
+        {% for u in users %}<option value="{{ u }}"{% if u == user_id %} selected{% endif %}>{{ u }}</option>{% endfor %}
+        <option value="__new__">➕ New user…</option>
+      </select>
+      <input type="text" id="user-new" placeholder="new-user-name"
+             pattern="[a-zA-Z0-9._\-]+" style="display:none;margin-top:8px">
+      <p class="hint">Pick a user to edit their style, or create a new one.</p>
+      {% else %}
+      <input type="text" id="user_id" name="user_id" value="{{ user_id }}" placeholder="e.g. alice">
+      <p class="hint">Switch IDs and reload to edit another user's style.</p>
+      {% endif %}
+    </div>
+
+    <div class="field">
+      <label for="style">Style instructions</label>
+      <textarea id="style" name="style"
+                placeholder="e.g. Answer in Italian. Start with a one-line TL;DR, then short bullet points.">{{ style }}</textarea>
+      <p class="hint">Leave empty for the default behavior.</p>
+    </div>
+
+    <button type="submit" class="btn btn-primary">Save</button>
+  </form>
+</div>
+
+<div id="settings-result"></div>
+
+<script>
+// Selecting an existing user reloads to load their saved style; "➕ New user…"
+// reveals a free-text field and swaps the `user_id` form-field name onto it so
+// the new name is what gets saved.
+function onUserSelect() {
+  const sel = document.getElementById('user-select');
+  const inp = document.getElementById('user-new');
+  if (!sel) return;
+  if (sel.value === '__new__') {
+    inp.style.display = '';
+    inp.setAttribute('name', 'user_id');
+    inp.required = true;
+    sel.removeAttribute('name');
+    inp.focus();
+  } else {
+    window.location = '/settings?user_id=' + encodeURIComponent(sel.value);
+  }
+}
+</script>
+{% endblock %}

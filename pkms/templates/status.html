@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Status{% endblock %}
+{% block heading %}System Status{% endblock %}
+{% block subheading %}Vault health and service availability{% endblock %}
+
+{% block content %}
+
+<div class="card">
+  <div class="card-title">Projects</div>
+  <div class="status-grid">
+    {% for p in projects %}
+    <div class="status-item">
+      <div class="label">vault/{{ p.name }}/</div>
+      <div class="value">{{ p.raw }} raw · {{ p.wiki }} wiki</div>
+    </div>
+    {% endfor %}
+    <div class="status-item">
+      <div class="label">.search-index</div>
+      <div class="value {% if db %}ok{% else %}missing{% endif %}">
+        {% if db %}✓ exists{% else %}✗ missing{% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Services</div>
+  <div class="status-grid">
+    <div class="status-item">
+      <div class="label">Qdrant</div>
+      <div class="value {% if qdrant_ok %}ok{% else %}missing{% endif %}">
+        {% if qdrant_ok %}✓ reachable{% else %}✗ unreachable{% endif %}
+      </div>
+    </div>
+    <div class="status-item">
+      <div class="label">Ollama</div>
+      <div class="value {% if ollama_ok %}ok{% else %}missing{% endif %}">
+        {% if ollama_ok %}✓ reachable{% else %}✗ unreachable{% endif %}
+      </div>
+    </div>
+    <div class="status-item">
+      <div class="label">Anthropic API key</div>
+      <div class="value {% if api_key_set %}ok{% else %}missing{% endif %}">
+        {% if api_key_set %}✓ set{% else %}✗ not set{% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Index</div>
+  <div class="status-grid">
+    <div class="status-item">
+      <div class="label">Raw documents</div>
+      <div class="value">{{ raw_count }}</div>
+    </div>
+    <div class="status-item">
+      <div class="label">Wiki articles</div>
+      <div class="value">{{ wiki_count }}</div>
+    </div>
+    <div class="status-item">
+      <div class="label">Vault root</div>
+      <div class="value" style="font-size:12px;font-family:var(--font-mono);word-break:break-all">{{ vault_root }}</div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

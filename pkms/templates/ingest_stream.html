@@ -1,0 +1,7 @@
+<div hx-ext="sse" sse-connect="/ui/ingest/stream/{{ job_id }}" sse-close="done">
+  <div class="terminal-box">
+    <div class="terminal-title">⚙ Ingesting <code>{{ target }}</code></div>
+    <div class="terminal" sse-swap="log" hx-swap="beforeend scroll:bottom"></div>
+  </div>
+  <div sse-swap="done" hx-swap="innerHTML"></div>
+</div>

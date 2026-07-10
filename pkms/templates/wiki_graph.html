@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Wiki graph — {{ project }}{% endblock %}
+{% block heading %}Wiki graph{% endblock %}
+{% block subheading %}Article link graph · project {{ project }}{% endblock %}
+
+{% block content %}
+<div class="card">
+  <form method="get" action="/wiki/graph" style="display:flex;gap:10px;align-items:flex-end">
+    <div class="field" style="max-width:260px;margin-bottom:0">
+      <label for="project">Project</label>
+      <select id="project" name="project" onchange="this.form.submit()">
+        {% for p in projects %}<option value="{{ p }}"{% if p == project %} selected{% endif %}>{{ p }}</option>{% endfor %}
+      </select>
+    </div>
+    <a href="/wiki?project={{ project }}" class="btn btn-secondary">← Article list</a>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title">Graph</div>
+  <p class="hint" style="margin-bottom:10px">
+    <span style="color:#4f8cff">●</span> articles ·
+    <span style="color:#9aa0a6">●</span> concepts (<code>[[wikilinks]]</code>) ·
+    <span style="color:#27ae60">●</span> tags. Click an article to open it, a tag to filter the list.
+  </p>
+  <div style="margin-bottom:10px;display:flex;gap:18px;font-size:13px;color:var(--muted)">
+    <label><input type="checkbox" id="tg-concepts" checked> Show concepts</label>
+    <label><input type="checkbox" id="tg-tags" checked> Show tags</label>
+    <span id="graph-count"></span>
+  </div>
+  <div id="graph" style="height:70vh;border:1px solid var(--border);border-radius:8px;overflow:hidden"></div>
+</div>
+
+<script src="https://unpkg.com/force-graph@1/dist/force-graph.min.js"></script>
+<script>
+  (function () {
+    const project = {{ project | tojson }};
+    const el = document.getElementById('graph');
+    const countEl = document.getElementById('graph-count');
+    const COLOR = { article: '#4f8cff', concept: '#9aa0a6', tag: '#27ae60' };
+
+    const Graph = ForceGraph()(el)
+      .width(el.clientWidth)
+      .height(el.clientHeight)
+      .nodeId('id')
+      .nodeLabel('label')
+      .nodeColor(n => COLOR[n.type] || '#888')
+      .nodeVal(n => n.type === 'article' ? 4 : 1)
+      .linkColor(() => 'rgba(120,120,120,0.35)')
+      .onNodeClick(n => {
+        if (n.type === 'article') {
+          window.location = '/wiki/' + encodeURIComponent(project) + '/' + encodeURIComponent(n.id);
+        } else if (n.type === 'tag') {
+          window.location = '/wiki?project=' + encodeURIComponent(project) + '&tag=' + encodeURIComponent(n.label);
+        }
+      });
+
+    function load() {
+      const c = document.getElementById('tg-concepts').checked ? 1 : 0;
+      const t = document.getElementById('tg-tags').checked ? 1 : 0;
+      const url = `/wiki/graph/data?project=${encodeURIComponent(project)}&concepts=${c}&tags=${t}`;
+      fetch(url)
+        .then(r => r.json())
+        .then(data => {
+          const d = (data.nodes && data.nodes.length) ? data : { nodes: [], links: [] };
+          Graph.graphData(d);
+          countEl.textContent = d.nodes.length + ' nodes · ' + d.links.length + ' links';
+        })
+        .catch(() => { countEl.textContent = 'failed to load graph data'; });
+    }
+
+    document.getElementById('tg-concepts').addEventListener('change', load);
+    document.getElementById('tg-tags').addEventListener('change', load);
+    window.addEventListener('resize', () => Graph.width(el.clientWidth).height(el.clientHeight));
+    load();
+  })();
+</script>
+{% endblock %}

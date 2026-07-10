@@ -1,0 +1,17 @@
+{% if error %}
+<div class="alert alert-error">
+  <strong>Ingest failed:</strong> {{ error }}
+</div>
+{% elif ingest_status == "SKIPPED" %}
+<div class="alert alert-warn">
+  <strong>Skipped</strong> — <code>{{ path }}</code> is already indexed at the current hash. No changes detected.
+</div>
+{% else %}
+<div class="alert alert-success">
+  <strong>Ingested</strong> <code>{{ path }}</code> —
+  {{ n_chunks }} chunk{% if n_chunks != 1 %}s{% endif %} embedded into the raw collection.
+  {% if auto_compile %}
+    <br>Auto-compile triggered.
+  {% endif %}
+</div>
+{% endif %}

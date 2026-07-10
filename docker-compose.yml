@@ -1,0 +1,74 @@
+# PKMS backend services
+# Bring up: docker compose up -d
+# Agents run on the host and connect over localhost.
+
+services:
+
+  # ── Qdrant — vector store ───────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: pkms_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - ${HOME}/.pkms/qdrant:/qdrant/storage
+    healthcheck:
+      # The qdrant image ships no curl/wget — use bash's /dev/tcp probe
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── Ollama — local LLM + embedding (CPU-only) ───────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: pkms_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ${HOME}/.pkms/ollama:/root/.ollama
+    # No NVIDIA_* env vars — CPU-only deployment
+    environment:
+      # CPU default is 1 loaded model → mistral (metadata) and nomic (embeddings)
+      # evict each other, causing 20s reloads and intermittent embedding 500s.
+      # Keep both resident and don't unload them.
+      - OLLAMA_MAX_LOADED_MODELS=3
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_NUM_PARALLEL=4
+    healthcheck:
+      # The ollama image ships no curl — the CLI probes the local API itself
+      test: ["CMD", "ollama", "ls"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── ollama-init — pull required models once after Ollama starts ─────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: pkms_ollama_init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until ollama ls >/dev/null 2>&1; do
+          echo "Waiting for Ollama…"; sleep 3
+        done
+        ollama pull mistral:7b
+        ollama pull nomic-embed-text
+        ollama pull llama3.2:1b
+        echo "Model pull complete."
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+  # ── Mem0 ────────────────────────────────────────────────────────────────────
+  # Mem0 is used as an embedded Python library (mem0ai), not a separate HTTP
+  # service. No container is required — the library manages its own SQLite
+  # backend at ~/.pkms/mem0/ on the host. If a centralised team Mem0 server
+  # becomes available, add it here and point PKMS_MEM0_URL to it in the env.

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.claude/
+.obsidian/
+# the vault is the root of the knowledge base — keep the empty dir as a
+# placeholder for cloners, but never ship anyone's actual documents
+vault/*
+!vault/.gitkeep

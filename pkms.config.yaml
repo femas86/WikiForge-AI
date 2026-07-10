@@ -1,0 +1,140 @@
+# pkms.config.yaml — PKMS system configuration
+# All paths relative to vault_root unless explicitly absolute.
+
+# ── VAULT ────────────────────────────────────────────────────────────────────
+vault:
+  root: ./vault                  # relative to repo root (IA_KBM/)
+
+# ── LLM ROUTER ───────────────────────────────────────────────────────────────
+llm_router:
+  agents:
+    coordinator:    ollama       # intent classification (API path only)
+    ingestor:       ollama       # metadata extraction
+    compiler:       groq         # article write/update
+    querier:        groq         # answer synthesis
+    linter:         claude       # (future; currently rule-based)
+  fallback:
+    claude:         ollama       # if Claude API unreachable, fall back to local
+    ollama:         claude       # if Ollama fails (e.g. cold-start/overload), use Claude
+    groq:           ollama       # if Groq fails (429/5xx), fall back to local mistral
+  models:
+    claude:         claude-sonnet-4-6
+    ollama:         mistral:7b          # :7b defaults to Q4_K_M (confirmed)
+    groq:           qwen/qwen3.6-27b    # Groq id; hybrid-thinking → _call_groq forces non-thinking
+  # SDK retries for Claude: it honours the server's Retry-After on 429, so a high
+  # count rides out rate-limit windows during bulk work instead of failing over.
+  claude_max_retries: 8
+
+# ── SERVICES ─────────────────────────────────────────────────────────────────
+qdrant:
+  host: localhost
+  port: 6333
+  collections:
+    raw:     raw
+    wiki:    wiki
+    outputs: outputs
+
+ollama:
+  host: localhost
+  port: 11434
+  models:
+    llm:       mistral:7b-q4_K_M
+    embedding: nomic-embed-text
+  timeout_seconds:       450   # LLM generation timeout (s) — CPU article compiles are slow
+  embed_timeout_seconds: 120   # embedding request timeout (s)
+  embed_batch_size:       32   # texts per /api/embed request — concurrency is server-side
+                               # (OLLAMA_NUM_PARALLEL in docker-compose.yml), the client just batches
+
+# Querier long-term memory provider (pluggable).
+# none = baseline · mem0 = managed Mem0 · amem = local Zettelkasten · mempalace = spatial/zero-LLM.
+# Set to mem0 to re-enable memory recall in the product.
+memory:
+  provider: none
+
+mem0:
+  # Managed Mem0 platform (app.mem0.ai). Credential is read from the
+  # MEM0_API_KEY environment variable, not from this file. Used when
+  # memory.provider == mem0.
+  provider: managed
+
+mempalace:
+  # Spatial / zero-LLM-write memory. Heavy optional dep: pip install '.[mempalace]'.
+  palace_path: ~/.pkms/mempalace
+
+# ── EMBEDDING ────────────────────────────────────────────────────────────────
+embedding:
+  model:     nomic-embed-text
+  dimension: 768
+
+# ── CHUNKING ─────────────────────────────────────────────────────────────────
+chunking:
+  strategy:   semantic           # semantic | fixed
+  max_tokens: 512
+  # semantic only. A paragraph at/above semantic_min_tokens is treated as "wide"
+  # (may hold several key concepts) and split by sentence embeddings; smaller
+  # paragraphs just merge structurally. Keep it well below max_tokens so embeddings
+  # drive real boundaries, not only rescue oversized glued blobs.
+  semantic_min_tokens: 200
+  # Within a wide block, force an extra split where the adjacent-sentence cosine
+  # distance is an outlier: mean + zscore*stddev (higher zscore = fewer breaks).
+  semantic_breakpoint_zscore: 1.0
+
+# ── INGEST ───────────────────────────────────────────────────────────────────
+ingest:
+  auto_compile: true             # trigger Compiler after every successful ingest
+  supported_extensions: [.md, .pdf, .html, .txt]
+  max_concurrent: 1              # parallel ingests (Ollama is single CPU-bound; raise only with a GPU / multiple Ollama instances)
+  metadata_temperature: 0.1      # low (near-deterministic) sampling for metadata extraction
+  metadata_model: llama3.2:1b    # small/fast Ollama model for metadata (mistral:7b is ~1.3 tok/s on CPU → times out)
+  metadata_num_predict: 256      # cap metadata output tokens (a short JSON) so it can't hang
+
+# ── FETCH (URL ingestion) ─────────────────────────────────────────────────────
+fetch:
+  timeout_seconds: 30            # httpx request timeout
+  user_agent: "pkms/0.1"
+  # arxiv abstract URLs are rewritten to the PDF download URL automatically.
+  # e.g. https://arxiv.org/abs/1706.03762 → https://arxiv.org/pdf/1706.03762
+  arxiv_rewrite: true
+
+# ── COMPILE ──────────────────────────────────────────────────────────────────
+compile:
+  crosslink_threshold: 0.82      # min cosine similarity to suggest a [[wiki-link]]
+  post_lint: true                # run Linter automatically after every compile
+  recover_on_startup: false       # on server start, compile any raw left uncompiled by an interrupted job
+  pace_seconds: 3                # pause between article compiles in a batch — smooths the
+                                 # request burst so we trip the LLM rate limit (429) less often
+  # B2 hierarchical (map-reduce) compile: if a doc's concatenated chunks exceed
+  # max_prompt_tokens, compile it in pieces (map each group → digest, then reduce
+  # digests → article) so no single LLM request blows the backend's per-request /
+  # TPM limit. Tuned for Groq free tier (8000 TPM incl. ~4096 output). Raise to
+  # ~100000 on Claude / Groq Dev tier so normal docs stay single-pass.
+  max_prompt_tokens: 3500
+  map_num_predict:   512         # output cap per map (digest) call
+
+# ── QUERY ────────────────────────────────────────────────────────────────────
+query:
+  top_k_wiki:  4                 # chunks retrieved from wiki collection (cut 8→4: keep the query
+  top_k_raw:   4                 # prompt under Groq free-tier 8000 TPM, incl. the 4096 output budget)
+  mem0_recall: 5                 # prior interactions recalled per query
+
+# ── LOCK ─────────────────────────────────────────────────────────────────────
+lock:
+  ttl_seconds:      300          # lock expires after 5 min (crash safety)
+  max_wait_seconds: 60           # give up acquiring lock after 1 min
+
+# ── AGENT POOL ───────────────────────────────────────────────────────────────
+agent_pool:
+  max_concurrent_ingestors: 4
+  max_concurrent_compilers: 1
+  max_concurrent_queriers:  8
+  max_concurrent_linters:   1
+
+# ── WATCHER ──────────────────────────────────────────────────────────────────
+watcher:
+  enabled:          true
+  debounce_seconds: 5            # wait 5s after last change before triggering ingest
+  max_batch_seconds: 50          # latency bound: a path pending this long is flushed even if
+                                 # events keep arriving (default would be 10x debounce_seconds)
+  watch_paths: [raw/]            # per-project subdirs: matches {project}/raw/ under the vault root
+                                 # (the whole vault is observed recursively, so new projects are
+                                 # picked up without a restart); wiki/ is never watched

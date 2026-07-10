@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block heading %}{{ title }}{% endblock %}
+{% block subheading %}wiki / {{ project }} / {{ slug }}{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+    <a href="/wiki?project={{ project }}" class="hint">← All articles in {{ project }}</a>
+    <div style="display:flex;align-items:center;gap:12px">
+      {% if date %}<span class="hint">compiled {{ date }}</span>{% endif %}
+      <button type="button" class="btn btn-danger"
+              hx-post="/ui/remove"
+              hx-vals='{"slug": "{{ slug }}", "project": "{{ project }}"}'
+              hx-target="#remove-result"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this"
+              hx-confirm="Remove this document from the vault? This deletes the raw source, this article, its embeddings and index/citation entries. This cannot be undone.">
+        Remove document
+      </button>
+    </div>
+  </div>
+  <div id="remove-result" style="margin-top:8px"></div>
+  {% if tags %}
+  <div class="wiki-tags" style="margin-top:8px">
+    {% for t in tags %}<span class="tag">{{ t }}</span>{% endfor %}
+  </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="answer-body" data-markdown="{{ body | e }}"></div>
+</div>
+
+{% if backlinks %}
+<div class="card">
+  <div class="card-title">Linked from ({{ backlinks | length }})</div>
+  <ul class="wiki-list">
+    {% for b in backlinks %}
+    <li class="wiki-item">
+      <a href="/wiki/{{ project }}/{{ b.slug }}" class="wiki-link-title">{{ b.title }}</a>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% if sources %}
+<div class="card">
+  <div class="card-title">Sources</div>
+  <ul class="wiki-list">
+    {% for s in sources %}
+    <li class="wiki-item"><code>{{ s }}</code></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endblock %}

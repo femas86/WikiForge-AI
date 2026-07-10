@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Query{% endblock %}
+{% block heading %}Ask the Knowledge Base{% endblock %}
+{% block subheading %}Dual-search wiki + raw sources · LLM synthesis{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-title">Question</div>
+
+  <form hx-post="/ui/query"
+        hx-target="#result"
+        hx-swap="innerHTML"
+        hx-indicator="#spinner"
+        hx-disabled-elt="button[type=submit]">
+
+    <div class="field">
+      <label for="text">Your question</label>
+      <textarea id="text" name="text" placeholder="What are the key ideas in the attention paper?" required></textarea>
+    </div>
+
+    <div class="field" style="max-width:260px">
+      <label for="user_id">Your name / ID</label>
+      {% if users %}
+      <select id="user_id" name="user_id">
+        {% for u in users %}<option value="{{ u }}"{% if u == (current_user|default('default')) %} selected{% endif %}>{{ u }}</option>{% endfor %}
+      </select>
+      <p class="hint">Applies your saved answer style (set it in Settings).</p>
+      {% else %}
+      <input type="text" id="user_id" name="user_id" value="{{ current_user|default('default') }}" placeholder="e.g. alice">
+      <p class="hint">Used to personalise recall from past queries.</p>
+      {% endif %}
+    </div>
+
+    <div class="field" style="max-width:260px">
+      <label for="project">Project</label>
+      <select id="project" name="project">
+        {% for p in projects %}<option value="{{ p }}"{% if p == "default" %} selected{% endif %}>{{ p }}</option>{% endfor %}
+      </select>
+      <p class="hint">Searches only this project's documents.</p>
+    </div>
+
+    <button type="submit" class="btn btn-primary">
+      <span>Ask</span>
+    </button>
+  </form>
+</div>
+
+<div id="spinner" class="spinner htmx-indicator">Thinking…</div>
+
+<div id="result"></div>
+{% endblock %}

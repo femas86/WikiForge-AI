@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PKMS — {% block title %}Knowledge Base{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/htmx.org@2.0.0/dist/htmx.min.js"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+
+<aside class="sidebar">
+  <div class="sidebar-brand">
+    <h1>⬡ PKMS</h1>
+    <p>Team Knowledge Base</p>
+  </div>
+  <nav>
+    <a href="/query" class="{% if active == 'query' %}active{% endif %}">
+      <span class="icon">🔍</span> Query
+    </a>
+    <a href="/ingest" class="{% if active == 'ingest' %}active{% endif %}">
+      <span class="icon">📥</span> Ingest
+    </a>
+    <a href="/wiki" class="{% if active == 'wiki' %}active{% endif %}">
+      <span class="icon">📖</span> Wiki
+    </a>
+    <a href="/ui/status" class="{% if active == 'status' %}active{% endif %}">
+      <span class="icon">📊</span> Status
+    </a>
+    <a href="/settings" class="{% if active == 'settings' %}active{% endif %}">
+      <span class="icon">⚙️</span> Settings
+    </a>
+  </nav>
+  <div class="sidebar-footer">pkms / v0.1.0</div>
+</aside>
+
+<div class="main">
+  <div class="topbar">
+    <h2>{% block heading %}{% endblock %}</h2>
+    <span style="font-size:13px;color:var(--muted)">{% block subheading %}{% endblock %}</span>
+  </div>
+  <div class="content">
+    {% block content %}{% endblock %}
+  </div>
+</div>
+
+<script>
+  // Render any .markdown-raw spans after HTMX swaps them in
+  function renderMarkdown() {
+    document.querySelectorAll('[data-markdown]').forEach(el => {
+      if (el.dataset.rendered) return;
+      el.innerHTML = DOMPurify.sanitize(marked.parse(el.dataset.markdown || el.textContent));
+      el.dataset.rendered = '1';
+    });
+  }
+  document.addEventListener('htmx:afterSwap', renderMarkdown);
+  document.addEventListener('DOMContentLoaded', renderMarkdown);
+
+  // Tab switching (ingest page)
+  function switchTab(tabId) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelector('[data-tab="' + tabId + '"]').classList.add('active');
+    document.getElementById(tabId).classList.add('active');
+  }
+</script>
+
+</body>
+</html>

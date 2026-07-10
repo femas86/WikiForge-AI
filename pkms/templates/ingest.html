@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Ingest{% endblock %}
+{% block heading %}Add to the Knowledge Base{% endblock %}
+{% block subheading %}Paste a URL or upload a file{% endblock %}
+
+{% block content %}
+<!-- In-progress ingests started earlier this session; re-attaches on page load -->
+<div id="active-ingests" hx-get="/ui/ingest/active" hx-trigger="load" hx-swap="innerHTML"></div>
+
+<div class="card">
+  <div class="tab-bar">
+    <button class="tab active" data-tab="tab-url" onclick="switchTab('tab-url')">🔗 URL</button>
+    <button class="tab" data-tab="tab-file" onclick="switchTab('tab-file')">📄 File upload</button>
+  </div>
+
+  <!-- URL tab -->
+  <div id="tab-url" class="tab-panel active">
+    <form hx-post="/ui/ingest/url"
+          hx-target="#ingest-result"
+          hx-swap="innerHTML"
+          hx-indicator="#ingest-spinner"
+          hx-disabled-elt="button[type=submit]">
+
+      <div class="field">
+        <label for="url">URL</label>
+        <input type="url" id="url" name="url"
+               placeholder="https://arxiv.org/abs/1706.03762"
+               required>
+        <p class="hint">Supports arxiv abstract pages (auto-rewrites to PDF), arxiv PDFs, and web articles.</p>
+      </div>
+
+      <div class="field" style="max-width:260px">
+        <label for="project-url-select">Project</label>
+        <select id="project-url-select" name="project" onchange="toggleNewProject('url')">
+          {% for p in projects %}<option value="{{ p }}"{% if p == "default" %} selected{% endif %}>{{ p }}</option>{% endfor %}
+          <option value="__new__">➕ New project…</option>
+        </select>
+        <input type="text" id="project-url-new" placeholder="new-project-name"
+               pattern="[a-z0-9][a-z0-9._-]{0,63}" style="display:none;margin-top:8px">
+        <p class="hint">Pick an existing project or create a new one.</p>
+      </div>
+
+      <button type="submit" class="btn btn-primary">Fetch &amp; ingest</button>
+    </form>
+  </div>
+
+  <!-- File upload tab -->
+  <div id="tab-file" class="tab-panel">
+    <form hx-post="/ui/ingest/file"
+          hx-target="#ingest-result"
+          hx-swap="innerHTML"
+          hx-indicator="#ingest-spinner"
+          hx-disabled-elt="button[type=submit]"
+          hx-encoding="multipart/form-data">
+
+      <div class="field">
+        <label for="file">File</label>
+        <input type="file" id="file" name="file"
+               accept=".pdf,.md,.txt,.html"
+               required>
+        <p class="hint">Supported: .pdf, .md, .txt, .html</p>
+      </div>
+
+      <div class="field" style="max-width:260px">
+        <label for="project-file-select">Project</label>
+        <select id="project-file-select" name="project" onchange="toggleNewProject('file')">
+          {% for p in projects %}<option value="{{ p }}"{% if p == "default" %} selected{% endif %}>{{ p }}</option>{% endfor %}
+          <option value="__new__">➕ New project…</option>
+        </select>
+        <input type="text" id="project-file-new" placeholder="new-project-name"
+               pattern="[a-z0-9][a-z0-9._-]{0,63}" style="display:none;margin-top:8px">
+        <p class="hint">Pick an existing project or create a new one.</p>
+      </div>
+
+      <button type="submit" class="btn btn-primary">Upload &amp; ingest</button>
+    </form>
+  </div>
+</div>
+
+<div id="ingest-spinner" class="spinner htmx-indicator">Ingesting…</div>
+
+<div id="ingest-result"></div>
+
+<!-- Reindex: force re-embed every raw doc in a project + recompile the wiki fresh.
+     Use after a payload/chunking change — unchanged files skip a normal ingest. -->
+<div class="card">
+  <div class="card-title">Reindex a project</div>
+  <p class="hint" style="margin-bottom:12px">
+    Force re-embeds every raw document and rebuilds the wiki from scratch (grounded).
+    Use this after a chunking/embedding change — a normal re-ingest skips unchanged files.
+    This can take a while for large projects.
+  </p>
+  <form hx-post="/ui/reindex"
+        hx-target="#ingest-result"
+        hx-swap="innerHTML"
+        hx-disabled-elt="button[type=submit]"
+        hx-confirm="Reindex this project? Every raw doc is re-embedded and the wiki is rebuilt from scratch. This can take a while.">
+    <div class="field" style="max-width:260px">
+      <label for="project-reindex-select">Project</label>
+      <select id="project-reindex-select" name="project">
+        {% for p in projects %}<option value="{{ p }}"{% if p == "default" %} selected{% endif %}>{{ p }}</option>{% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="btn btn-secondary">Reindex &amp; rebuild</button>
+  </form>
+</div>
+
+<script>
+// Reveal a free-text field when "➕ New project…" is chosen; swap the `project`
+// form-field name to whichever control is active so only one value submits.
+function toggleNewProject(which) {
+  const sel = document.getElementById('project-' + which + '-select');
+  const inp = document.getElementById('project-' + which + '-new');
+  if (sel.value === '__new__') {
+    inp.style.display = '';
+    inp.setAttribute('name', 'project');
+    inp.required = true;
+    sel.removeAttribute('name');
+    inp.focus();
+  } else {
+    inp.style.display = 'none';
+    inp.removeAttribute('name');
+    inp.required = false;
+    sel.setAttribute('name', 'project');
+  }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,42 @@
+<div class="answer-card">
+  <div class="answer-body" data-markdown="{{ answer_md | e }}"></div>
+
+  <div class="answer-meta">
+    <span class="badge badge-{{ coverage }}">{{ coverage }}</span>
+
+    {% if coverage == "raw_only" %}
+    <span class="badge badge-warn" style="background:var(--warn-bg);color:var(--warn)">
+      ⚠ No compiled article yet — run <code>pkms compile</code>
+    </span>
+    {% endif %}
+
+    {% if sources %}
+    <span class="sources-label">Sources:</span>
+    <span class="sources-list">{{ sources | join(" · ") }}</span>
+    {% endif %}
+  </div>
+
+  {% if coverage and coverage != "none" %}
+  <div class="answer-promote" style="margin-top:14px;border-top:1px solid var(--border);padding-top:12px">
+    <form hx-post="/ui/promote"
+          hx-target="#promote-result"
+          hx-swap="innerHTML"
+          hx-disabled-elt="button[type=submit]"
+          style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <input type="hidden" name="question" value="{{ question | e }}">
+      <input type="hidden" name="answer_md" value="{{ answer_md | e }}">
+      <input type="hidden" name="sources" value="{{ sources | join(' · ') | e }}">
+      <input type="hidden" name="project" value="{{ project | e }}">
+      <div class="field" style="margin-bottom:0;flex:1;min-width:220px">
+        <label for="note-title">Note title</label>
+        <input type="text" id="note-title" name="title" value="{{ question | e }}">
+      </div>
+      <button type="submit" class="btn btn-secondary" title="Save this answer as a note in the knowledge base">
+        📝 Trasforma in nota
+      </button>
+    </form>
+    <p class="hint">Saves the answer into <code>raw/notes/</code> and recompiles it into the wiki.</p>
+  </div>
+  <div id="promote-result"></div>
+  {% endif %}
+</div>
