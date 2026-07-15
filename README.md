@@ -14,6 +14,10 @@ Ispirato all'idea di "LLM-compiled wiki" di Andrej Karpathy, esteso dal singolo
 utente al **team**: progetti multipli, agenti con permessi separati, concorrenza
 gestita, interfaccia web condivisa.
 
+![Grafo dei link della wiki](assets/ui-graph.png)
+*Il grafo navigabile della conoscenza: articoli, concetti e tag interconnessi,
+generato automaticamente dai `[[wikilink]]` compilati.*
+
 ---
 
 ## Come funziona
@@ -170,6 +174,15 @@ provider mal configurato lo dichiara con un errore, non degrada in silenzio.
   browser della wiki con backlink, filtro per tag e **grafo dei link** navigabile,
   impostazioni per-utente, "trasforma una risposta in nota".
 - **CLI**: `pkms ingest | compile | query | lint | watch | serve`, con `--project`.
+
+| Interroga | Ingest |
+|---|---|
+| ![Query](assets/ui-query.png) | ![Ingest](assets/ui-ingest.png) |
+
+Le risposte applicano lo **stile personale** di ciascun utente (tono, lingua,
+struttura) senza mai alterare la wiki condivisa:
+
+![Settings — stile risposta per-utente](assets/ui-settings.png)
 
 La wiki è Markdown puro con `[[wikilink]]` risolvibili, quindi apribile anche in
 Obsidian come vista di sola lettura — ma la web UI (col suo grafo) è la superficie
