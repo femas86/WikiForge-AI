@@ -9,6 +9,8 @@ dependencies = [
   "mem0ai",
   "watchdog",
   "pdfminer.six",
+  "pypdf",          # B6: fallback PDF extractor when pdfminer glues words
+  "trafilatura",    # B6: main-content HTML extraction (drops nav/boilerplate/scripts)
   "fastapi",
   "uvicorn",
   "gitpython",

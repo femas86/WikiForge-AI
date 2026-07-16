@@ -110,3 +110,49 @@ def test_reconcile_compiles_only_projects_with_pending(tmp_path):
     assert total == 1
     assert mc.call_count == 1
     assert mc.call_args.kwargs["project"] == "p1"
+
+
+# ── handle_watch reconcile→ready gate (B3) ────────────────────────────────────
+
+def test_handle_watch_writes_ready_after_reconcile(tmp_path):
+    """The watcher must reconcile raw↔wiki BEFORE signalling readiness, so a
+    launcher waiting on the marker never starts the server on an inconsistent
+    vault."""
+    ready = tmp_path / ".pkms" / "watcher.ready"
+    seen = {}
+
+    def reconcile_spy(vault_root, config):
+        seen["ready_during_reconcile"] = ready.exists()   # must still be absent
+        return 0
+
+    inst = MagicMock()
+    inst.is_alive.return_value = False                     # while-loop exits at once
+    inst.start.side_effect = lambda: seen.__setitem__("ready_at_watch_start", ready.exists())
+
+    with patch.object(coord, "_ensure_db", return_value="db"), \
+         patch.object(coord, "_watcher_ready_path", return_value=ready), \
+         patch.object(coord, "reconcile_projects", side_effect=reconcile_spy), \
+         patch.object(coord, "VaultWatcher", return_value=inst):
+        coord.handle_watch("/vault", CFG)
+
+    assert seen["ready_during_reconcile"] is False   # reconcile ran first, no marker yet
+    assert seen["ready_at_watch_start"] is True      # marker written before watching began
+    inst.start.assert_called_once()
+
+
+def test_handle_watch_signals_ready_even_if_reconcile_fails(tmp_path):
+    """A reconcile failure must not wedge the watcher unready forever — it logs
+    and still signals readiness so the stack can come up."""
+    ready = tmp_path / ".pkms" / "watcher.ready"
+    seen = {}
+    inst = MagicMock()
+    inst.is_alive.return_value = False
+    inst.start.side_effect = lambda: seen.__setitem__("ready_at_watch_start", ready.exists())
+
+    with patch.object(coord, "_ensure_db", return_value="db"), \
+         patch.object(coord, "_watcher_ready_path", return_value=ready), \
+         patch.object(coord, "reconcile_projects", side_effect=RuntimeError("boom")), \
+         patch.object(coord, "VaultWatcher", return_value=inst):
+        coord.handle_watch("/vault", CFG)
+
+    assert seen["ready_at_watch_start"] is True      # readiness signalled despite failure

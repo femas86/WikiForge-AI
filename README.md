@@ -35,10 +35,17 @@ generato automaticamente dai `[[wikilink]]` compilati.*
   Claude o Groq. Un unico router decide, per-agente, con fallback automatico.
 - **Grounding by design.** Il testo di ogni chunk viaggia nel payload vettoriale: gli
   articoli sono scritti dal contenuto reale delle fonti, non allucinati dai titoli.
-- **Provenance.** Ogni articolo dichiara da quali documenti nasce; rimuovere una fonte
-  ne pulisce wiki, indice, vettori e link entranti.
+- **Documenti lunghi a piacere.** La compilazione è limitata su *entrambi* i lati
+  dell'LLM: mappatura-riduzione delle fonti in ingresso, e generazione **sezione per
+  sezione** in uscita. Così anche una tesi da 200 pagine diventa un articolo *completo*,
+  senza troncamenti — pure su modelli locali o free tier.
+- **Estrazione robusta.** Fallback PDF quando l'estrattore incolla le parole; estrazione
+  del contenuto principale dalle pagine HTML (via nav, boilerplate e JavaScript).
+- **Provenance + audit.** Ogni articolo dichiara le fonti; rimuovere una fonte ne pulisce
+  wiki, indice, vettori e link entranti. Un linter opzionale usa un LLM per segnalare
+  contraddizioni, incoerenze e articoli-stub.
 - **Zero framework agentici.** Pipeline + blackboard + locking su primitive standard
-  (FastAPI, httpx, qdrant-client, SQLite). ~5.400 righe di Python, test inclusi.
+  (FastAPI, httpx, qdrant-client, SQLite). ~5.700 righe di Python, oltre 400 test.
 
 ---
 

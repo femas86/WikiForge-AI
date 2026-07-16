@@ -484,3 +484,62 @@ def test_fetch_and_ingest_retries_on_429_with_retry_after(tmp_path):
     assert result["status"] == "DONE"
     assert mg.call_count == 2           # retried after the 429
     ms.assert_called_once_with(7.0)     # honoured Retry-After
+
+
+# ── B6: extraction quality (glued-PDF fallback + HTML main-content) ───────────
+
+import pkms.ingestor as _ing
+
+
+def test_space_ratio_and_looks_glued():
+    assert _ing._looks_glued("Neuro" + "SymbolicAIin2024xyz" * 30) is True
+    assert _ing._looks_glued("This is normal prose with many spaces. " * 30) is False
+    assert _ing._looks_glued("short") is False   # length floor
+
+
+def test_parse_pdf_falls_back_to_pypdf_when_glued():
+    glued = "Neuro-SymbolicAIin2024andbeyondwithnowordspacesatall" * 30
+    spaced = "Neuro Symbolic AI in 2024 and beyond with proper spacing here. " * 30
+    with patch("pdfminer.high_level.extract_text", return_value=glued), \
+         patch("pkms.ingestor._parse_pdf_pypdf", return_value=spaced):
+        out = _ing._parse_pdf("x.pdf")
+    assert out == spaced   # better-spaced extraction wins
+
+
+def test_parse_pdf_keeps_pdfminer_when_clean():
+    good = "This is a normal sentence with plenty of spaces in it. " * 20
+    with patch("pdfminer.high_level.extract_text", return_value=good), \
+         patch("pkms.ingestor._parse_pdf_pypdf") as mock_pypdf:
+        out = _ing._parse_pdf("x.pdf")
+    assert out == good
+    mock_pypdf.assert_not_called()   # no fallback when spacing is fine
+
+
+_HTML_FIXTURE = """<html><head><title>T</title>
+<script>var x = {a:1}; doEvilTracking();</script>
+<style>.nav{color:red}</style></head>
+<body>
+<nav>Home About Login Signup</nav>
+<article><h1>Contrastive Learning</h1>
+<p>InfoNCE is a contrastive loss used in self-supervised representation learning.
+It maximises agreement between positive pairs while pushing negative samples apart,
+and a temperature parameter controls the sharpness of the resulting distribution.</p>
+</article>
+<footer>Copyright 2026 Privacy Terms</footer>
+</body></html>"""
+
+
+def test_parse_html_extracts_article_drops_boilerplate(tmp_path):
+    f = tmp_path / "page.html"; f.write_text(_HTML_FIXTURE, encoding="utf-8")
+    out = _ing._parse_html(str(f))
+    assert "InfoNCE is a contrastive loss" in out   # article body kept
+    assert "doEvilTracking" not in out              # inline JS dropped
+    assert "color:red" not in out                   # inline CSS dropped
+
+
+def test_parse_html_bs4_fallback_drops_script(tmp_path):
+    f = tmp_path / "page.html"; f.write_text(_HTML_FIXTURE, encoding="utf-8")
+    with patch("trafilatura.extract", return_value=None):   # force the bs4 fallback path
+        out = _ing._parse_html(str(f))
+    assert "doEvilTracking" not in out
+    assert "InfoNCE is a contrastive loss" in out

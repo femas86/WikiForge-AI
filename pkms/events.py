@@ -6,6 +6,7 @@ loggers while the job's thread is bound via a ContextVar, and pushes the
 formatted lines onto the job's queue. An SSE endpoint drains the queue.
 """
 
+import asyncio
 import logging
 import queue
 import threading
@@ -157,6 +158,61 @@ def stream(job_id: str) -> Iterator[tuple[str, str]]:
         except queue.Empty:
             yield ("ping", "")
             continue
+        yield (kind, payload)
+        if kind == "done":
+            return
+    yield ("done", "")
+
+
+# Non-blocking poll cadence for the async stream. Small enough that SSE latency
+# stays invisible, but the coroutine sleeps on the event loop between polls
+# instead of blocking a thread on queue.get.
+_ASTREAM_POLL_SECONDS = 0.1
+
+
+async def astream(job_id: str):
+    """Async twin of stream(): same ("log"|"ping"|"done") events, but never
+    blocks a threadpool worker.
+
+    The sync stream() blocks on queue.get for up to KEEPALIVE_SECONDS per
+    iteration; served from a sync endpoint it pins one anyio threadpool worker
+    for the whole connection (up to STREAM_MAX_SECONDS = 900s), so a handful of
+    open streams can starve request handling. This version polls the
+    (thread-safe) queue with get_nowait and awaits asyncio.sleep between polls,
+    so an open stream costs a task, not a thread.
+    """
+    with _jobs_lock:
+        state = _jobs.get(job_id)
+    if state is None:
+        yield ("done", "")
+        return
+
+    # Re-attach to an already-finished job: flush buffered lines, then result.
+    if state.status == "done":
+        while True:
+            try:
+                kind, payload = state.queue.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "done":
+                yield ("done", payload)
+                return
+            yield (kind, payload)
+        yield ("done", state.result_html)
+        return
+
+    deadline = time.monotonic() + STREAM_MAX_SECONDS
+    last_ping = time.monotonic()
+    while time.monotonic() < deadline:
+        try:
+            kind, payload = state.queue.get_nowait()
+        except queue.Empty:
+            if time.monotonic() - last_ping >= KEEPALIVE_SECONDS:
+                last_ping = time.monotonic()
+                yield ("ping", "")
+            await asyncio.sleep(_ASTREAM_POLL_SECONDS)
+            continue
+        last_ping = time.monotonic()
         yield (kind, payload)
         if kind == "done":
             return

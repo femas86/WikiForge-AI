@@ -370,11 +370,16 @@ def handle_query(
     )
 
 
-def handle_lint(vault_root: str, config: dict[str, Any], project: str = "default") -> dict[str, Any]:
-    """Run lint checks for a project. The Linter is read-only — no lock needed (see pkms_seq_lint.md)."""
+def handle_lint(vault_root: str, config: dict[str, Any], project: str = "default",
+                semantic: bool | None = None) -> dict[str, Any]:
+    """Run lint checks for a project. The Linter is read-only — no lock needed (see pkms_seq_lint.md).
+
+    semantic: opt-in LLM audit (contradictions/coherence/stubs). None → config
+    lint.llm_audit (default off). The auto post-compile lint leaves it None."""
     validate_project(project)
     db = _ensure_db(vault_root)
-    result = run_lint(vault_root=vault_root, db_path=db, config=config, project=project)
+    result = run_lint(vault_root=vault_root, db_path=db, config=config, project=project,
+                      semantic=semantic)
     logger.info("Lint: %d issues — %s", result["total_issues"], result["report_path"])
     return result
 
@@ -531,6 +536,8 @@ def main() -> None:
     # lint
     p_lint = sub.add_parser("lint", help="Lint the wiki for consistency issues")
     p_lint.add_argument("--project", type=normalize_project, default="default", help="Project to lint (default: default)")
+    p_lint.add_argument("--semantic", action="store_true",
+                        help="also run the LLM semantic audit (contradictions/coherence/stubs; costs LLM calls)")
 
     # watch
     sub.add_parser("watch", help="Watch vault/raw/ for new/changed files")
@@ -595,7 +602,8 @@ def main() -> None:
             print(f"Sources: {', '.join(result['sources'])}")
 
     elif args.verb == "lint":
-        result = handle_lint(vault_root=vault_root, config=config, project=args.project)
+        result = handle_lint(vault_root=vault_root, config=config, project=args.project,
+                             semantic=(args.semantic or None))
         print(f"[DONE] {result['total_issues']} issue(s) — {result['report_path']}")
 
     elif args.verb == "watch":

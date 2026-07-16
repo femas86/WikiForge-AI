@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import sqlite3
@@ -7,6 +8,8 @@ from typing import Any
 
 from pkms.db import get_stale_articles
 from pkms.guards import guard_write, validate_project
+from pkms.ingestor import _estimate_tokens
+from pkms.llm import complete
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +153,128 @@ def _check_frontmatter(vault_dir: Path, project: str) -> list[dict[str, Any]]:
     return issues
 
 
+# ── semantic audit (LLM) — B1 ─────────────────────────────────────────────────
+
+_SEMANTIC_BODY_CHARS = 6000   # default per-article body cap in the digest (override: lint.semantic_body_chars)
+_CLIP_MARKER = "[…article body truncated here for this audit — NOT a defect]"
+
+_SEMANTIC_PROMPT = """\
+You are auditing a compiled Markdown wiki for QUALITY and CONSISTENCY. Below are
+wiki articles (slug, title, one-line summary, body). Identify CONCRETE problems:
+
+- "contradiction": two articles assert incompatible facts (name both slugs).
+- "incoherence": an article contradicts itself / is internally inconsistent.
+- "stub": the article's visible content is essentially empty — only headings, or a
+  sentence or two with no real information.
+- "unsupported": an article makes strong claims that read as invented rather than
+  the kind of content its sources would plausibly support.
+
+CRITICAL: a body may be CLIPPED for this audit — it then ends with the marker
+"{clip_marker}". That clip is an ARTIFACT of the audit, NOT a defect. NEVER report
+truncation, "cuts off abruptly", or incompleteness. NEVER call an article a "stub"
+when the clip marker is present (you are not seeing the whole article).
+
+Report ONLY real, specific problems — do NOT invent issues to fill a quota. If the
+articles look fine, return an empty list.
+
+Reply with a JSON object ONLY, no prose:
+{{"findings": [{{"kind": "contradiction|incoherence|stub|unsupported", "severity": "ERROR|WARN|INFO", "articles": ["slug", ...], "detail": "one sentence"}}]}}
+
+Articles:
+{digest}
+"""
+
+
+def _frontmatter_field(text: str, field: str) -> str:
+    m = re.search(rf"^{field}:\s*[\"']?(.+?)[\"']?\s*$", text, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _article_digest_units(vault_dir: Path, project: str, body_chars: int) -> list[str]:
+    """One compact digest string per article: slug + title + summary + capped body.
+
+    A body longer than `body_chars` is clipped and the clip is marked explicitly, so
+    the auditor doesn't mistake OUR truncation for a defect in the article (the
+    prompt is told to ignore the marker)."""
+    articles_dir = vault_dir / project / "wiki" / "articles"
+    units: list[str] = []
+    if not articles_dir.exists():
+        return units
+    for p in sorted(articles_dir.glob("*.md")):
+        try:
+            md = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        title = _frontmatter_field(md, "title") or p.stem
+        summary = _frontmatter_field(md, "summary_1line")
+        body = re.sub(r"^---\n.*?\n---\n?", "", md, count=1, flags=re.DOTALL).strip()
+        shown = body[:body_chars]
+        if len(body) > body_chars:
+            shown += f"\n\n{_CLIP_MARKER}"
+        units.append(f"### {p.stem}\ntitle: {title}\nsummary: {summary}\n{shown}")
+    return units
+
+
+def _group_by_budget(units: list[str], budget: int) -> list[list[str]]:
+    groups: list[list[str]] = []
+    cur: list[str] = []
+    cur_tok = 0
+    for u in units:
+        t = _estimate_tokens(u)
+        if cur and cur_tok + t > budget:
+            groups.append(cur)
+            cur, cur_tok = [], 0
+        cur.append(u)
+        cur_tok += t
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _parse_findings(raw: str) -> list[dict[str, Any]]:
+    raw = re.sub(r"^```[^\n]*\n?", "", raw.strip())
+    raw = re.sub(r"\n?```$", "", raw.strip())
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return []
+    findings = obj.get("findings") if isinstance(obj, dict) else obj
+    return [f for f in findings if isinstance(f, dict)] if isinstance(findings, list) else []
+
+
+def _check_semantic(vault_dir: Path, project: str, config: dict[str, Any]) -> list[dict[str, Any]]:
+    """LLM audit for contradictions / incoherence / stubs. Opt-in (costs LLM calls);
+    routed via the 'linter' agent. Budget-aware: articles are batched under the
+    prompt budget; contradictions spanning different batches may be missed (logged)."""
+    body_chars = config.get("lint", {}).get("semantic_body_chars", _SEMANTIC_BODY_CHARS)
+    units = _article_digest_units(vault_dir, project, body_chars)
+    if not units:
+        return []
+    budget = config.get("lint", {}).get(
+        "semantic_max_prompt_tokens", config.get("compile", {}).get("max_prompt_tokens", 3500))
+    groups = _group_by_budget(units, max(500, budget - 800))  # room for scaffold + output
+    if len(groups) > 1:
+        logger.info("Semantic audit: %d articles split into %d batches — contradictions "
+                    "spanning different batches may be missed", len(units), len(groups))
+    issues: list[dict[str, Any]] = []
+    for group in groups:
+        prompt = _SEMANTIC_PROMPT.format(digest="\n\n".join(group), clip_marker=_CLIP_MARKER)
+        try:
+            raw = complete("linter", prompt, config, response_format="json")
+        except Exception as exc:
+            logger.warning("Semantic audit batch failed (skipping): %s", exc)
+            continue
+        for f in _parse_findings(raw):
+            issues.append({
+                "type": "SEMANTIC",
+                "severity": str(f.get("severity") or "WARN").upper(),
+                "kind": f.get("kind", "quality"),
+                "articles": f.get("articles", []),
+                "detail": f.get("detail", ""),
+            })
+    return issues
+
+
 # ── report formatter ──────────────────────────────────────────────────────────
 
 def _build_report(issues_by_type: dict[str, list], timestamp: str) -> str:
@@ -158,6 +283,7 @@ def _build_report(issues_by_type: dict[str, list], timestamp: str) -> str:
     orphans = issues_by_type.get("orphans", [])
     missing = issues_by_type.get("missing_files", [])
     frontmatter = issues_by_type.get("bad_frontmatter", [])
+    semantic = issues_by_type.get("semantic", [])
     total = sum(len(v) for v in issues_by_type.values())
 
     lines = [
@@ -171,6 +297,7 @@ def _build_report(issues_by_type: dict[str, list], timestamp: str) -> str:
         f"| Orphaned articles | {len(orphans)} |",
         f"| Missing files | {len(missing)} |",
         f"| Bad frontmatter | {len(frontmatter)} |",
+        f"| Semantic (LLM) | {len(semantic)} |",
         f"| **Total** | **{total}** |",
         "",
     ]
@@ -205,6 +332,13 @@ def _build_report(issues_by_type: dict[str, list], timestamp: str) -> str:
             lines.append(f"- `{i['path']}` — missing fields: {', '.join(i['missing_fields'])}")
         lines.append("")
 
+    if semantic:
+        lines += ["## Semantic audit (LLM)", ""]
+        for i in semantic:
+            arts = ", ".join(f"`{a}`" for a in i.get("articles", [])) or "—"
+            lines.append(f"- **{i['kind']}** [{i['severity']}] {arts}: {i['detail']}")
+        lines.append("")
+
     if total == 0:
         lines.append("_No issues found — vault is consistent._")
 
@@ -218,8 +352,14 @@ def lint(
     db_path: str,
     config: dict[str, Any],
     project: str = "default",
+    semantic: bool | None = None,
 ) -> dict[str, Any]:
     """Run all lint checks for a project; write vault/{project}/outputs/lint_report.md.
+
+    The rule-based checks (drift/links/orphans/missing/frontmatter) always run and
+    are cheap. The LLM semantic audit is OPT-IN because it costs LLM calls: it runs
+    only when `semantic=True`, or (when `semantic` is None) when `lint.llm_audit` is
+    set in config. The auto post-compile lint passes semantic=None → off by default.
 
     Returns {issues_by_type, total_issues, report_path}.
     The Linter is read-only except for the report write.
@@ -228,12 +368,16 @@ def lint(
     vault_dir = Path(vault_root) / "vault"
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    run_semantic = semantic if semantic is not None else bool(
+        config.get("lint", {}).get("llm_audit", False))
+
     issues_by_type: dict[str, list] = {
         "drift": [],
         "broken_links": [],
         "orphans": [],
         "missing_files": [],
         "bad_frontmatter": [],
+        "semantic": [],
     }
 
     # Check 1 — Drift
@@ -266,6 +410,13 @@ def lint(
         issues_by_type["bad_frontmatter"] = _check_frontmatter(vault_dir, project)
     except Exception as exc:
         logger.warning("Frontmatter check failed (skipping): %s", exc)
+
+    # Check 6 — Semantic audit (LLM) — opt-in only
+    if run_semantic:
+        try:
+            issues_by_type["semantic"] = _check_semantic(vault_dir, project, config)
+        except Exception as exc:
+            logger.warning("Semantic audit failed (skipping): %s", exc)
 
     total_issues = sum(len(v) for v in issues_by_type.values())
     report_md = _build_report(issues_by_type, timestamp)

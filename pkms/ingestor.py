@@ -38,15 +38,72 @@ def _parse_text(path: str) -> str:
     return Path(path).read_text(encoding="utf-8", errors="replace")
 
 
+def _space_ratio(text: str) -> float:
+    return text.count(" ") / len(text) if text else 1.0
+
+
+def _looks_glued(text: str) -> bool:
+    """True when extraction ran words together (e.g. 'Neuro-SymbolicAIin2024').
+
+    Normal prose is ~15-18% spaces; a glued pdfminer extraction is far lower.
+    Guarded by a length floor so tiny/structured docs don't false-positive."""
+    return len(text) > 200 and _space_ratio(text[:5000]) < 0.08
+
+
 def _parse_pdf(path: str) -> str:
+    """pdfminer first; if it glues words, try pypdf and keep the better-spaced text.
+
+    Glued text (B6) wrecks tags and embeddings downstream, so it's worth a second
+    extractor rather than indexing a run-on blob."""
     from pdfminer.high_level import extract_text
-    return extract_text(path)
+    text = extract_text(path) or ""
+    if _looks_glued(text):
+        logger.warning("PDF %s: pdfminer text looks glued (space ratio %.3f) — trying pypdf",
+                       path, _space_ratio(text[:5000]))
+        alt = _parse_pdf_pypdf(path)
+        if alt and _space_ratio(alt) > _space_ratio(text):
+            logger.info("PDF %s: using pypdf extraction (better spacing)", path)
+            return alt
+    return text
+
+
+def _parse_pdf_pypdf(path: str) -> str:
+    try:
+        from pypdf import PdfReader
+        return "\n".join((page.extract_text() or "") for page in PdfReader(path).pages)
+    except Exception as exc:
+        logger.warning("pypdf fallback failed for %s: %s", path, exc)
+        return ""
 
 
 def _parse_html(path: str) -> str:
+    """Main-content extraction (drops nav/boilerplate/scripts), with fallbacks.
+
+    The old regex tag-strip ingested everything — nav, footers, and inline JS
+    (the boilerplate that made scraped pages like infonce.html useless). Prefer
+    trafilatura's article extraction; fall back to bs4 with script/style removed;
+    last resort, the naive regex strip."""
     raw = Path(path).read_text(encoding="utf-8", errors="replace")
-    # Strip tags, collapse whitespace
-    text = re.sub(r"<[^>]+>", " ", raw)
+
+    try:
+        import trafilatura
+        extracted = trafilatura.extract(raw, include_comments=False, include_tables=True)
+        if extracted and extracted.strip():
+            return extracted.strip()
+        logger.info("trafilatura found no main content in %s — falling back", path)
+    except Exception as exc:
+        logger.warning("trafilatura extraction failed for %s: %s", path, exc)
+
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(raw, "html.parser")
+        for tag in soup(["script", "style", "noscript", "head", "nav", "header", "footer"]):
+            tag.decompose()
+        return re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+    except Exception as exc:
+        logger.warning("bs4 HTML parse failed for %s: %s", path, exc)
+
+    text = re.sub(r"<[^>]+>", " ", raw)          # last resort
     return re.sub(r"\s+", " ", text).strip()
 
 

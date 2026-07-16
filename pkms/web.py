@@ -36,7 +36,7 @@ from pkms.coordinator import (
     _watcher_ready_path,
 )
 from pkms.db import init_db
-from pkms.events import create_job, install_handler, list_active, run_job, stream
+from pkms.events import astream, create_job, install_handler, list_active, run_job
 from pkms.guards import guard_write, list_projects, load_config, normalize_project, validate_project
 from pkms.linter import _extract_wiki_links
 from pkms.lock import LockTimeout
@@ -912,10 +912,13 @@ def ui_ingest_active(request: Request):
 
 
 @app.get("/ui/ingest/stream/{job_id}")
-def ui_ingest_stream(job_id: str):
-    """SSE stream of one ingest job's log lines; closes with the result card."""
-    def event_source():
-        for kind, payload in stream(job_id):
+async def ui_ingest_stream(job_id: str):
+    """SSE stream of one ingest job's log lines; closes with the result card.
+
+    async so an open stream costs an event-loop task, not a pinned threadpool
+    worker (see events.astream)."""
+    async def event_source():
+        async for kind, payload in astream(job_id):
             if kind == "ping":
                 yield ": keep-alive\n\n"
             elif kind == "log":

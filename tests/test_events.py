@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import threading
 import time
@@ -7,6 +8,7 @@ import pytest
 import pkms.events as events
 from pkms.events import (
     JobLogHandler,
+    astream,
     bind_job,
     create_job,
     finish,
@@ -22,6 +24,13 @@ def _drain(job_id):
     return list(stream(job_id))
 
 
+def _adrain(job_id):
+    """Drain the async astream to a list (no pytest-asyncio needed)."""
+    async def go():
+        return [ev async for ev in astream(job_id)]
+    return asyncio.run(go())
+
+
 # ── queue basics ──────────────────────────────────────────────────────────────
 
 def test_publish_then_finish_streams_in_order():
@@ -35,6 +44,45 @@ def test_publish_then_finish_streams_in_order():
 
 def test_stream_unknown_job_completes_immediately():
     assert _drain("nonexistent") == [("done", "")]
+
+
+# ── async stream (SSE 1.3): same contract, no pinned thread ────────────────────
+
+def test_astream_publish_then_finish_streams_in_order():
+    job = create_job()
+    publish(job, "step 1")
+    publish(job, "step 2")
+    finish(job, "<div>done</div>")
+    # finished job → astream takes the reattach branch, drains without sleeping
+    assert _adrain(job) == [("log", "step 1"), ("log", "step 2"), ("done", "<div>done</div>")]
+
+
+def test_astream_unknown_job_completes_immediately():
+    assert _adrain("nonexistent") == [("done", "")]
+
+
+def test_astream_reattach_to_done_job_redelivers_result():
+    job = create_job()
+    finish(job, "<div>final</div>")
+    _adrain(job)                      # first consumer drains the queue
+    assert _adrain(job) == [("done", "<div>final</div>")]   # re-attach still gets result
+
+
+def test_astream_running_job_polls_until_done_without_blocking():
+    # A running job: publish from another thread mid-stream, then finish.
+    # astream must pick both up by polling (no thread pinned on queue.get).
+    job = create_job()
+    events.mark_running(job)
+
+    def producer():
+        time.sleep(0.05); publish(job, "late line")
+        time.sleep(0.05); finish(job, "<div>ok</div>")
+
+    t = threading.Thread(target=producer); t.start()
+    got = _adrain(job)
+    t.join()
+    assert ("log", "late line") in got
+    assert got[-1] == ("done", "<div>ok</div>")
 
 
 def test_done_job_lingers_for_reattach():

@@ -12,7 +12,7 @@ llm_router:
     ingestor:       ollama       # metadata extraction
     compiler:       groq         # article write/update
     querier:        groq         # answer synthesis
-    linter:         claude       # (future; currently rule-based)
+    linter:         groq         # (future; currently rule-based)
   fallback:
     claude:         ollama       # if Claude API unreachable, fall back to local
     ollama:         claude       # if Ollama fails (e.g. cold-start/overload), use Claude
@@ -38,7 +38,7 @@ ollama:
   host: localhost
   port: 11434
   models:
-    llm:       mistral:7b-q4_K_M
+    llm:       mistral:7b
     embedding: nomic-embed-text
   timeout_seconds:       450   # LLM generation timeout (s) — CPU article compiles are slow
   embed_timeout_seconds: 120   # embedding request timeout (s)
@@ -110,6 +110,32 @@ compile:
   # ~100000 on Claude / Groq Dev tier so normal docs stay single-pass.
   max_prompt_tokens: 3500
   map_num_predict:   512         # output cap per map (digest) call
+  # Output cap for the FINAL article. On Groq free tier, prompt (<=max_prompt_tokens)
+  # + this must stay under ~8000 TPM/request, so 4096 is near the ceiling there and
+  # very long articles will truncate (the compiler logs a warning when they do).
+  # On Claude or a paid Groq tier, raise this (e.g. 8192) to stop the truncation.
+  article_num_predict: 4096
+  # B9 output-side chunking: write long articles SECTION BY SECTION (outline, then
+  # one bounded call per section) so arbitrarily long documents (e.g. a 200-page
+  # thesis) compile into a COMPLETE article even on free-tier / local models, where
+  # a single generation would hit the output cap. Used for large sources and as a
+  # rescue when a single-pass compile truncates.
+  sectioned_compile: true
+  section_num_predict: 2048      # output cap per section (each section stays small)
+
+# ── LINT ─────────────────────────────────────────────────────────────────────
+lint:
+  # Opt-in LLM semantic audit (contradictions / incoherence / stubs). OFF by
+  # default: it costs LLM calls, and the automatic post-compile lint must stay
+  # cheap. Enable per-run with `pkms lint --semantic`, or globally here.
+  llm_audit: true
+  # Articles are batched under this token budget per audit call (defaults to
+  # compile.max_prompt_tokens); batches larger than one may miss cross-batch
+  # contradictions (logged when it happens).
+  # semantic_max_prompt_tokens: 3500
+  # Per-article body chars shown to the auditor; a longer body is clipped with a
+  # marker the prompt is told to ignore (so the clip isn't mistaken for a defect).
+  # semantic_body_chars: 6000
 
 # ── QUERY ────────────────────────────────────────────────────────────────────
 query:
@@ -126,7 +152,7 @@ lock:
 agent_pool:
   max_concurrent_ingestors: 4
   max_concurrent_compilers: 1
-  max_concurrent_queriers:  8
+  max_concurrent_queriers:  4
   max_concurrent_linters:   1
 
 # ── WATCHER ──────────────────────────────────────────────────────────────────

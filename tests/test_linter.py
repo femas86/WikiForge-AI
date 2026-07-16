@@ -271,3 +271,94 @@ def test_lint_guard_write_called(tmp_path):
         lint(str(tmp_path), db, CONFIG)
     mock_guard.assert_called_once()
     assert mock_guard.call_args[0][0] == "linter"
+
+
+# ── B1: LLM semantic audit ────────────────────────────────────────────────────
+
+import json as _json
+from unittest.mock import MagicMock
+
+
+def _two_articles(tmp_path):
+    vault_dir = _make_vault(tmp_path)
+    arts = vault_dir / "default" / "wiki" / "articles"
+    (arts / "alpha.md").write_text(
+        "---\ntitle: Alpha\nsummary_1line: About X\n---\n\nX was released in 2020.", encoding="utf-8")
+    (arts / "beta.md").write_text(
+        "---\ntitle: Beta\nsummary_1line: Also about X\n---\n\nX was released in 2022.", encoding="utf-8")
+    return vault_dir
+
+
+def test_semantic_audit_off_by_default_no_llm_call(tmp_path):
+    _two_articles(tmp_path)
+    db = str(tmp_path / "idx.db"); init_db(db)
+    with patch("pkms.linter.complete") as mock_llm:
+        result = lint(str(tmp_path), db, CONFIG, project="default")   # semantic=None, no config flag
+    mock_llm.assert_not_called()
+    assert result["issues_by_type"]["semantic"] == []
+
+
+def test_semantic_audit_parses_findings_when_enabled(tmp_path):
+    vault_dir = _two_articles(tmp_path)
+    db = str(tmp_path / "idx.db"); init_db(db)
+    finding = {"findings": [{"kind": "contradiction", "severity": "ERROR",
+                             "articles": ["alpha", "beta"],
+                             "detail": "alpha says 2020, beta says 2022"}]}
+    with patch("pkms.linter.complete", return_value=_json.dumps(finding)) as mock_llm:
+        result = lint(str(tmp_path), db, CONFIG, project="default", semantic=True)
+    mock_llm.assert_called()                       # LLM audit ran
+    sem = result["issues_by_type"]["semantic"]
+    assert len(sem) == 1 and sem[0]["kind"] == "contradiction"
+    assert sem[0]["articles"] == ["alpha", "beta"]
+    assert "Semantic audit (LLM)" in result["report_md"]
+    assert "contradiction" in result["report_md"]
+
+
+def test_semantic_audit_config_flag_enables_it(tmp_path):
+    _two_articles(tmp_path)
+    db = str(tmp_path / "idx.db"); init_db(db)
+    cfg = {**CONFIG, "lint": {"llm_audit": True}}
+    with patch("pkms.linter.complete", return_value='{"findings": []}') as mock_llm:
+        lint(str(tmp_path), db, cfg, project="default")   # semantic=None → reads config
+    mock_llm.assert_called()
+
+
+def test_semantic_audit_batches_under_budget(tmp_path):
+    # two large articles + a budget whose usable room (budget-800, floored at 500)
+    # fits one but not both → one LLM call per article
+    vault_dir = _make_vault(tmp_path)
+    arts = vault_dir / "default" / "wiki" / "articles"
+    big = "word " * 400   # ~2000 chars → capped to 1500 → ~385 tokens per digest unit
+    (arts / "alpha.md").write_text(f"---\ntitle: Alpha\n---\n\n{big}", encoding="utf-8")
+    (arts / "beta.md").write_text(f"---\ntitle: Beta\n---\n\n{big}", encoding="utf-8")
+    db = str(tmp_path / "idx.db"); init_db(db)
+    cfg = {**CONFIG, "lint": {"semantic_max_prompt_tokens": 1500}}  # usable 700; one ~385-tok unit fits, two don't
+    with patch("pkms.linter.complete", return_value='{"findings": []}') as mock_llm:
+        lint(str(tmp_path), db, cfg, project="default", semantic=True)
+    assert mock_llm.call_count == 2                 # one batch per article
+
+
+def test_semantic_audit_survives_bad_json(tmp_path):
+    _two_articles(tmp_path)
+    db = str(tmp_path / "idx.db"); init_db(db)
+    with patch("pkms.linter.complete", return_value="not json at all"):
+        result = lint(str(tmp_path), db, CONFIG, project="default", semantic=True)
+    assert result["issues_by_type"]["semantic"] == []   # unparseable → no findings, no crash
+
+
+def test_semantic_digest_marks_clip_only_for_long_bodies(tmp_path):
+    """Bug A regression: a body longer than body_chars is clipped WITH the marker
+    (so the auditor won't mistake OUR cut for a defect); a short body is untouched."""
+    from pkms.linter import _article_digest_units, _CLIP_MARKER
+    vault_dir = _make_vault(tmp_path)
+    arts = vault_dir / "default" / "wiki" / "articles"
+    (arts / "short.md").write_text("---\ntitle: Short\n---\n\nTiny complete body.\n\n## Sources\n- a.md",
+                                   encoding="utf-8")
+    (arts / "long.md").write_text("---\ntitle: Long\n---\n\n" + ("lots of real content. " * 100),
+                                  encoding="utf-8")
+    units = _article_digest_units(vault_dir, "default", body_chars=200)
+    joined = "\n".join(units)
+    long_unit = next(u for u in units if u.startswith("### long"))
+    short_unit = next(u for u in units if u.startswith("### short"))
+    assert _CLIP_MARKER in long_unit        # long body clipped + marked
+    assert _CLIP_MARKER not in short_unit    # short body shown whole, no marker

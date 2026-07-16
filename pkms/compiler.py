@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -240,6 +241,34 @@ Requirements:
 Reply with the full Markdown article only — no explanation outside the article.
 """
 
+# B9 output-side chunking — write arbitrarily long articles section by section so
+# no single generation hits the output-token cap (works on free-tier / local models).
+_OUTLINE_PROMPT = """\
+You are planning a technical wiki article from the source material below.
+Reply with a JSON object ONLY:
+{{"frontmatter": {{"title": "…", "summary_1line": "one sentence", "tags": ["…", "…"]}},
+  "sections": ["Introduction", "Architecture", "Results", "…"]}}
+Choose 3–8 section headings that comprehensively organise the material, in reading
+order. Do NOT write any section bodies here. Ground title/summary/tags in the material.
+
+Source material:
+{source}
+"""
+
+_SECTION_PROMPT = """\
+You are writing ONE section of a technical wiki article titled "{title}".
+Write ONLY the "## {section}" section — its heading and body, nothing else: no
+frontmatter, no other sections, no Sources list. Use [[wiki-link]] syntax for related
+concepts (placeholders, filled later). Ground strictly in the source material below;
+no invention, no padding.
+
+Full article outline (context — do NOT write the other sections):
+{outline}
+
+Source material:
+{source}
+"""
+
 _CROSSLINK_PROMPT = """\
 Given these new wiki articles and related existing articles, suggest [[wiki-links]] to add.
 Only suggest high-confidence links (similarity >= {threshold}).
@@ -320,6 +349,86 @@ def _mapreduce_notes(units: list[str], config: dict[str, Any]) -> str:
     return _CHUNK_SEP.join(units)
 
 
+def _looks_truncated(article: str) -> bool:
+    """The WRITE/UPDATE/REDUCE prompts all end the article with a Sources section;
+    its absence means generation was cut off before finishing (hit the output cap)."""
+    return "## Sources" not in article and "##Sources" not in article
+
+
+def _prepend_conventions(prompt: str, conventions: str) -> str:
+    """Prepend the project schema AFTER .format() so braces in it can't break it."""
+    if not conventions:
+        return prompt
+    return f"Project writing conventions (follow these where they apply):\n{conventions}\n\n---\n\n{prompt}"
+
+
+def _sources_section(sources: list[dict[str, Any]]) -> str:
+    paths = sorted({s["raw_path"] for s in sources})
+    return "## Sources\n\n" + "\n".join(f"- {p}" for p in paths) + "\n"
+
+
+def _assemble_sectioned(fm: dict[str, Any], section_bodies: list[str],
+                        sources: list[dict[str, Any]], fallback_title: str) -> str:
+    """Build the final article: frontmatter + summary + sections + deterministic Sources."""
+    title = str(fm.get("title") or fallback_title)
+    summary = str(fm.get("summary_1line") or "")
+    tags = fm.get("tags") if isinstance(fm.get("tags"), list) else []
+    src_paths = sorted({s["raw_path"] for s in sources})
+    lines = [
+        "---",
+        f'title: "{title}"',
+        f"tags: [{', '.join(str(t) for t in tags)}]",
+        f"sources: [{', '.join(src_paths)}]",
+        f"date: {_now()[:10]}",
+        f'summary_1line: "{summary}"',
+        "---",
+        "",
+    ]
+    if summary:
+        lines += [summary, ""]
+    for body in section_bodies:
+        lines += [body.strip(), ""]
+    return "\n".join(lines) + _sources_section(sources)
+
+
+def _compile_sectioned(source_text: str, sources: list[dict[str, Any]],
+                       conventions: str, config: dict[str, Any], fallback_title: str) -> str | None:
+    """Write the article SECTION BY SECTION (B9): outline first, then one bounded
+    call per section, so no single generation hits the output-token cap. Returns
+    None if the outline can't be parsed (caller falls back to single-pass)."""
+    outline_prompt = _prepend_conventions(_OUTLINE_PROMPT.format(source=source_text), conventions)
+    try:
+        raw = _strip_code_fence(complete("compiler", outline_prompt, config,
+                                         num_predict=1024, response_format="json"))
+        outline = json.loads(raw)
+    except Exception as exc:
+        logger.warning("Sectioned compile: outline failed (%s) — falling back", exc)
+        return None
+    fm = outline.get("frontmatter") if isinstance(outline.get("frontmatter"), dict) else {}
+    sections = [s for s in (outline.get("sections") or []) if isinstance(s, str) and s.strip()
+                and "source" not in s.lower()]   # Sources is appended deterministically
+    if not sections:
+        logger.warning("Sectioned compile: outline had no usable sections — falling back")
+        return None
+
+    title = str(fm.get("title") or fallback_title)
+    outline_md = "\n".join(f"- {s}" for s in sections)
+    section_out = config.get("compile", {}).get("section_num_predict", 2048)
+    bodies: list[str] = []
+    for heading in sections:
+        sp = _prepend_conventions(_SECTION_PROMPT.format(
+            title=title, section=heading, outline=outline_md, source=source_text), conventions)
+        body = _strip_code_fence(complete("compiler", sp, config, num_predict=section_out)).strip()
+        if not body:
+            continue
+        bodies.append(body if body.lstrip().startswith("#") else f"## {heading}\n\n{body}")
+    if not bodies:
+        logger.warning("Sectioned compile: no section bodies produced — falling back")
+        return None
+    logger.info("Sectioned compile: assembled %d sections", len(bodies))
+    return _assemble_sectioned(fm, bodies, sources, fallback_title)
+
+
 def _compile_article(
     wiki_path: str,
     sources: list[dict[str, Any]],
@@ -329,37 +438,63 @@ def _compile_article(
 ) -> str:
     """Retrieve chunks, call the LLM, return article Markdown.
 
-    If the source is larger than compile.max_prompt_tokens it is compiled
-    hierarchically (map-reduce): each oversized group of chunks is summarised into
-    faithful notes, then the notes are reduced into the article — so no single LLM
-    request exceeds the backend's per-request / TPM limit (B2).
+    Large sources are handled on both sides of the LLM: the INPUT is bounded by B2
+    map-reduce (chunks → faithful notes ≤ max_prompt_tokens), and the OUTPUT is
+    bounded by B9 section-by-section generation (outline, then one bounded call per
+    section) so an arbitrarily long article never hits the output-token cap — even
+    on free-tier / local models. Single-pass is kept for the common short case, with
+    a sectioned rescue if it truncates.
 
-    conventions: optional project schema (vault/{project}/CLAUDE.md) prepended AFTER
-    .format() so braces in the schema can't break it.
+    conventions: optional project schema (vault/{project}/CLAUDE.md).
     """
     units = _chunk_texts(sources, config)
     chunks_text = _CHUNK_SEP.join(units)
     budget = config.get("compile", {}).get("max_prompt_tokens", 3500)
+    over_budget = _estimate_tokens(chunks_text) > budget
     article_file = vault_dir / Path(wiki_path).relative_to("vault")
     existing = article_file.read_text(encoding="utf-8") if article_file.exists() else None
+    sectioned_enabled = config.get("compile", {}).get("sectioned_compile", True)
+    fallback_title = Path(wiki_path).stem
 
-    if _estimate_tokens(chunks_text) > budget:
-        logger.info("Compile: %s over budget (~%d tok) — hierarchical map-reduce",
-                    Path(wiki_path).stem, _estimate_tokens(chunks_text))
-        notes = _mapreduce_notes(units, config)
-        prompt = _REDUCE_PROMPT.format(chunks_text=notes)
-    elif existing:
-        prompt = _UPDATE_PROMPT.format(existing=existing, chunks_text=chunks_text)
+    # Source context: bounded notes for large docs (B2), raw chunks otherwise.
+    if over_budget:
+        logger.info("Compile: %s over budget (~%d tok) — map-reduce notes",
+                    fallback_title, _estimate_tokens(chunks_text))
+        source_text = _mapreduce_notes(units, config)
     else:
-        prompt = _WRITE_PROMPT.format(chunks_text=chunks_text)
+        source_text = chunks_text
 
-    if conventions:
-        prompt = (
-            "Project writing conventions (follow these where they apply):\n"
-            f"{conventions}\n\n---\n\n{prompt}"
-        )
+    # Large source ⇒ article likely exceeds the output cap ⇒ write it section by
+    # section from the start (no wasted truncated single-pass, and each call stays
+    # small enough for free-tier TPM limits).
+    if sectioned_enabled and over_budget:
+        art = _compile_sectioned(source_text, sources, conventions, config, fallback_title)
+        if art:
+            return art
+        logger.warning("Compile: %s sectioned failed — trying single-pass", fallback_title)
 
-    return _strip_code_fence(complete("compiler", prompt, config))
+    # Single-pass (the common, short case).
+    if over_budget:
+        prompt = _REDUCE_PROMPT.format(chunks_text=source_text)
+    elif existing:
+        prompt = _UPDATE_PROMPT.format(existing=existing, chunks_text=source_text)
+    else:
+        prompt = _WRITE_PROMPT.format(chunks_text=source_text)
+    prompt = _prepend_conventions(prompt, conventions)
+
+    article_out = config.get("compile", {}).get("article_num_predict", 4096)
+    article = _strip_code_fence(complete("compiler", prompt, config, num_predict=article_out))
+
+    # Rescue a truncated single-pass by rebuilding section by section.
+    if _looks_truncated(article) and sectioned_enabled:
+        logger.info("Compile: %s single-pass truncated — rebuilding section by section", fallback_title)
+        art = _compile_sectioned(source_text, sources, conventions, config, fallback_title)
+        if art:
+            return art
+    if _looks_truncated(article):
+        logger.warning("Compile: %s looks truncated (no Sources section — hit the "
+                       "article_num_predict=%d output cap)", fallback_title, article_out)
+    return article
 
 
 def _embed_and_upsert_wiki(
@@ -462,7 +597,6 @@ def _crosslink_pass(
     config: dict[str, Any],
     project: str,
 ) -> int:
-    import json
     threshold = config["compile"]["crosslink_threshold"]
     wiki_collection = config["qdrant"]["collections"]["wiki"]
     links_added = 0

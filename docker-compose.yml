@@ -66,6 +66,15 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    # `ollama pull` is idempotent (skips already-present models), so this is
+    # safe to re-run. A containerised PKMS consumer should gate on model
+    # readiness with:
+    #     depends_on:
+    #       ollama-init:
+    #         condition: service_completed_successfully
+    # On the host, scripts/start.sh is the gate — it waits for the 3 models via
+    # /api/tags before starting the watcher/web server, so the first ingest
+    # can't 404 on a not-yet-pulled model.
 
   # ── Mem0 ────────────────────────────────────────────────────────────────────
   # Mem0 is used as an embedded Python library (mem0ai), not a separate HTTP

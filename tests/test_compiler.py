@@ -538,3 +538,79 @@ def test_compile_article_mapreduce_when_over_budget(tmp_path):
     assert seen["map"] >= 1        # summarised group(s)
     assert seen["reduce"] == 1     # single reduce into the article
     assert out == "# FINAL ARTICLE"
+
+
+# ── B: article output cap (num_predict) + truncation guard ────────────────────
+
+def _compile_patches(article_md):
+    return [
+        patch("pkms.compiler.complete", return_value=article_md),
+        patch("pkms.embed._embed_batch", side_effect=lambda ts, c: [[0.1, 0.2, 0.3, 0.4]] * len(ts)),
+        patch("pkms.compiler.scroll", return_value=[
+            {"id": "x", "payload": {"text": "chunk text", "path": "vault/default/raw/doc.pdf",
+                                    "chunk_index": 0, "section_heading": ""}}]),
+        patch("pkms.indexing.upsert_batch"),
+        patch("pkms.compiler.delete_by_ids"),
+        patch("pkms.compiler._git_commit"),
+        patch("pkms.compiler._rebuild_index"),
+        patch("pkms.compiler._crosslink_pass", return_value=0),
+    ]
+
+
+def test_compile_passes_article_num_predict(tmp_path):
+    db = _setup_compile(tmp_path)
+    cfg = {**CONFIG, "compile": {**CONFIG["compile"], "article_num_predict": 7777}}
+    patches = _compile_patches(ARTICLE_MD)
+    with patches[0] as mock_complete, patches[1], patches[2], patches[3], \
+         patches[4], patches[5], patches[6], patches[7]:
+        compile({"type": "full"}, str(tmp_path), db, "tok", cfg)
+    # the article-generation call carried the configured output cap (7777 is unique vs crosslink's default)
+    assert 7777 in [c.kwargs.get("num_predict") for c in mock_complete.call_args_list]
+
+
+def test_compile_warns_on_truncated_article(tmp_path, caplog):
+    db = _setup_compile(tmp_path)
+    truncated = "---\ntitle: X\ntags: [a]\nsources: [s]\ndate: 2026\n---\n\n## Intro\n\nBody cut off mid-sen"
+    patches = _compile_patches(truncated)   # no "## Sources" → truncation guard fires
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7]:
+        with caplog.at_level("WARNING", logger="pkms.compiler"):
+            compile({"type": "full"}, str(tmp_path), db, "tok", CONFIG)
+    assert any("looks truncated" in r.message for r in caplog.records)
+
+
+# ── B9 output-side chunking: section-by-section compile ───────────────────────
+
+def test_compile_sectioned_assembles_complete_article():
+    from pkms.compiler import _compile_sectioned, _looks_truncated
+    outline = json.dumps({
+        "frontmatter": {"title": "BERT", "summary_1line": "A masked language model.", "tags": ["nlp", "transformers"]},
+        "sections": ["Introduction", "Architecture"],
+    })
+    seq = [outline, "## Introduction\n\nBERT pre-trains deep bidirectional representations.",
+           "## Architecture\n\nA multi-layer Transformer encoder."]
+    with patch("pkms.compiler.complete", side_effect=seq):
+        art = _compile_sectioned("faithful notes about BERT",
+                                 [{"raw_path": "vault/default/raw/bert.pdf"}], "", CONFIG, "bert")
+    assert art.startswith("---")                       # frontmatter
+    assert 'title: "BERT"' in art
+    assert "## Introduction" in art and "## Architecture" in art   # every section present
+    assert "## Sources" in art and "vault/default/raw/bert.pdf" in art
+    assert not _looks_truncated(art)                   # complete by construction
+
+
+def test_compile_sectioned_returns_none_on_bad_outline():
+    from pkms.compiler import _compile_sectioned
+    with patch("pkms.compiler.complete", return_value="not valid json"):
+        out = _compile_sectioned("notes", [{"raw_path": "x.pdf"}], "", CONFIG, "t")
+    assert out is None                                 # caller falls back to single-pass
+
+
+def test_compile_sectioned_dedupes_sources_deterministically():
+    from pkms.compiler import _compile_sectioned
+    outline = json.dumps({"frontmatter": {"title": "T", "summary_1line": "s", "tags": []},
+                          "sections": ["Only"]})
+    with patch("pkms.compiler.complete", side_effect=[outline, "## Only\n\nbody"]):
+        art = _compile_sectioned("notes", [{"raw_path": "a.pdf"}, {"raw_path": "a.pdf"},
+                                           {"raw_path": "b.pdf"}], "", CONFIG, "t")
+    # Sources section built from the sources arg (deterministic), not the LLM
+    assert art.count("- a.pdf") == 1 and "- b.pdf" in art
