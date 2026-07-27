@@ -239,3 +239,42 @@ def test_init_db_migrates_pre_project_schema(tmp_path):
     init_db(db)  # must add the project column without losing data
     row = get_file(db, "vault/raw/old.pdf")
     assert row["project"] == "default"
+
+
+# ── project_members (B4 multi-user) ─────────────────────────────────────────────
+
+def test_member_add_get_role(tmp_path):
+    from pkms.db import init_db, add_member, get_member_role
+    db = str(tmp_path / "idx"); init_db(db)
+    assert get_member_role(db, "demo", "alice") is None      # not a member
+    add_member(db, "demo", "alice", "owner", "t0")
+    assert get_member_role(db, "demo", "alice") == "owner"
+
+
+def test_member_role_upsert(tmp_path):
+    from pkms.db import init_db, add_member, get_member_role
+    db = str(tmp_path / "idx"); init_db(db)
+    add_member(db, "demo", "alice", "viewer", "t0")
+    add_member(db, "demo", "alice", "editor", "t1")           # same (project,user) → update role
+    assert get_member_role(db, "demo", "alice") == "editor"
+
+
+def test_member_remove(tmp_path):
+    from pkms.db import init_db, add_member, remove_member, get_member_role
+    db = str(tmp_path / "idx"); init_db(db)
+    add_member(db, "demo", "alice", "owner", "t0")
+    remove_member(db, "demo", "alice")
+    assert get_member_role(db, "demo", "alice") is None
+
+
+def test_list_members_and_user_projects(tmp_path):
+    from pkms.db import init_db, add_member, list_members, list_user_projects
+    db = str(tmp_path / "idx"); init_db(db)
+    add_member(db, "demo", "alice", "owner", "t0")
+    add_member(db, "demo", "bob", "viewer", "t1")
+    add_member(db, "other", "alice", "editor", "t2")
+    members = list_members(db, "demo")
+    assert {m["user_id"] for m in members} == {"alice", "bob"}
+    assert next(m for m in members if m["user_id"] == "alice")["role"] == "owner"
+    assert list_user_projects(db, "alice") == ["demo", "other"]   # sorted, both projects
+    assert list_user_projects(db, "bob") == ["demo"]

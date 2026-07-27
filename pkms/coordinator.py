@@ -2,6 +2,7 @@ import argparse
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,13 +31,18 @@ from pkms.compiler import (
     _wiki_path,
 )
 from pkms.ingest_marker import clear_ingesting, is_ingesting, mark_ingesting
+from pkms.auth import ROLES, AccessDenied, role_allows
 from pkms.db import (
+    add_member,
     delete_article_sources,
     delete_file,
     get_article_sources,
     get_articles_for_raw,
+    get_member_role,
     init_db,
+    list_members,
     list_raw_paths,
+    remove_member,
     upsert_file,
 )
 from pkms.guards import guard_write, list_projects, load_config, normalize_project, validate_project
@@ -64,10 +70,128 @@ def _db_path(vault_root: str) -> str:
     return str(_vault_dir(vault_root) / ".search-index")
 
 
+def _authorize(db: str, project: str, auth_user: str | None, required: str) -> None:
+    """Enforce the caller's per-project role (B4).
+
+    `auth_user` is the TRUSTED identity (reverse-proxy header) — never a
+    client-supplied answer-style user. `auth_user is None` means an INTERNAL /
+    system / CLI-local call (auto-compile cascade, reconcile, recover, watcher):
+    authz is not enforced there — only user-facing web entry points pass a
+    concrete identity. A project with NO members is treated as unclaimed/legacy
+    and left open (backward compatible; guards bite once an owner adds members).
+    Raises AccessDenied when a named user lacks the required role on a claimed
+    project.
+    """
+    if auth_user is None:
+        return                                       # internal / system / CLI-local
+    members = list_members(db, project)
+    if not members:
+        return                                       # unclaimed / legacy → open
+    if not role_allows(get_member_role(db, project, auth_user), required):
+        raise AccessDenied(
+            f"user '{auth_user}' lacks the '{required}' role on project '{project}'"
+        )
+
+
 def _ensure_db(vault_root: str) -> str:
     db = _db_path(vault_root)
+    Path(db).parent.mkdir(parents=True, exist_ok=True)   # vault dir may not exist yet
     init_db(db)
     return db
+
+
+def check_access(vault_root: str, project: str, auth_user: str | None, required: str) -> None:
+    """Public authz pre-check for the web layer (raise AccessDenied before spawning
+    a background job, so a denied user gets an immediate 403 rather than a failed job)."""
+    _authorize(_ensure_db(vault_root), project, auth_user, required)
+
+
+# ── member management (B4 (4)) ─────────────────────────────────────────────────
+
+def _authorize_member_mgmt(
+    db: str,
+    project: str,
+    auth_user: str | None,
+    action: str,
+    target_user: str | None = None,
+    role: str | None = None,
+) -> None:
+    """Authorize a member-management action. Distinct from _authorize because of
+    the bootstrap ('claim') problem: an unclaimed project has NO owner, so an
+    owner-only rule would deadlock the very first assignment.
+
+    - CLI-local / internal (auth_user is None): full access — the trusted admin
+      tool. This is how the first owner is bootstrapped on a single-admin deploy.
+    - list: read-only; allowed for any member of a claimed project (viewer), and
+      trivially on an unclaimed one (returns []).
+    - add on an UNCLAIMED project: allowed ONLY as a self-claim (caller adds
+      THEMSELVES as owner). Any other add is refused ('claim it first') so a
+      project can never end up claimed-but-ownerless (a second deadlock).
+    - add / remove on a CLAIMED project: owner-only.
+    """
+    if auth_user is None:
+        return
+    members = list_members(db, project)
+    if action == "list":
+        if members and not role_allows(get_member_role(db, project, auth_user), "viewer"):
+            raise AccessDenied(f"user '{auth_user}' is not a member of project '{project}'")
+        return
+    if not members:
+        if action == "add" and target_user == auth_user and role == "owner":
+            return                                       # self-claim: bootstrap
+        raise AccessDenied(
+            f"project '{project}' is unclaimed — claim it (add yourself as owner) "
+            f"before managing members"
+        )
+    if not role_allows(get_member_role(db, project, auth_user), "owner"):
+        raise AccessDenied(
+            f"user '{auth_user}' must be an owner of project '{project}' to {action} members"
+        )
+
+
+def handle_member(
+    action: str,
+    project: str,
+    vault_root: str,
+    config: dict[str, Any],
+    user_id: str | None = None,
+    role: str | None = None,
+    auth_user: str | None = None,
+) -> dict[str, Any]:
+    """List / add / remove project members (B4 (4)). Roles: viewer|editor|owner.
+
+    The web layer passes the proxy-resolved identity as `auth_user`; the CLI passes
+    None (trusted-local admin, full access). Refuses to remove the last owner of a
+    claimed project (would strand it ownerless)."""
+    validate_project(project)
+    db = _ensure_db(vault_root)
+    _authorize_member_mgmt(db, project, auth_user, action, target_user=user_id, role=role)
+
+    if action == "list":
+        return {"project": project, "members": list_members(db, project)}
+
+    if action == "add":
+        if role not in ROLES:
+            raise ValueError(f"invalid role '{role}' — must be one of {', '.join(ROLES)}")
+        if not user_id:
+            raise ValueError("user_id is required to add a member")
+        add_member(db, project, user_id, role, datetime.now(timezone.utc).isoformat())
+        return {"project": project, "user_id": user_id, "role": role, "status": "ADDED"}
+
+    if action == "remove":
+        if not user_id:
+            raise ValueError("user_id is required to remove a member")
+        if get_member_role(db, project, user_id) == "owner":
+            owners = [m for m in list_members(db, project) if m["role"] == "owner"]
+            if len(owners) <= 1:
+                raise ValueError(
+                    f"cannot remove the last owner of project '{project}' "
+                    f"(it would leave the project ownerless)"
+                )
+        remove_member(db, project, user_id)
+        return {"project": project, "user_id": user_id, "status": "REMOVED"}
+
+    raise ValueError(f"unknown member action '{action}'")
 
 
 def _locks_db_path() -> str:
@@ -94,13 +218,15 @@ def _write_ingest_result(result: dict[str, Any], vault_root: str, db_path: str) 
 
 # ── verb handlers ─────────────────────────────────────────────────────────────
 
-def handle_ingest(target: str, vault_root: str, config: dict[str, Any], project: str = "default", force: bool = False) -> dict[str, Any]:
+def handle_ingest(target: str, vault_root: str, config: dict[str, Any], project: str = "default",
+                  force: bool = False, auth_user: str | None = None) -> dict[str, Any]:
     """Ingest a file path or URL into a project. Returns the ingestor result dict.
 
     force=True re-embeds even if the hash is unchanged (see ingest()).
     """
     validate_project(project)
     db = _ensure_db(vault_root)
+    _authorize(db, project, auth_user, "editor")
     is_url = target.startswith(("http://", "https://"))
     # Mark the file being ingested so the watcher skips it for the whole
     # ingest+compile cycle (cross-process dedup). For a local file we know the
@@ -133,7 +259,8 @@ def handle_ingest(target: str, vault_root: str, config: dict[str, Any], project:
             clear_ingesting(marker)
 
 
-def handle_compile(scope: dict[str, Any] | str, vault_root: str, config: dict[str, Any], project: str = "default") -> dict[str, Any]:
+def handle_compile(scope: dict[str, Any] | str, vault_root: str, config: dict[str, Any],
+                   project: str = "default", auth_user: str | None = None) -> dict[str, Any]:
     """Compile one project's wiki, holding that project's wiki lock for the duration.
 
     scope can be a pre-built dict or the legacy string "all" (treated as full scope).
@@ -144,6 +271,7 @@ def handle_compile(scope: dict[str, Any] | str, vault_root: str, config: dict[st
         if scope != "all":
             raise ValueError(f"Unknown compile scope string: {scope!r} (expected 'all' or a scope dict)")
         scope = {"type": "full"}
+    _authorize(_ensure_db(vault_root), project, auth_user, "editor")  # before the lock
     locks_db = _locks_db_path()
     try:
         with wiki_lock(project, "compiler", locks_db, config) as token:
@@ -196,6 +324,7 @@ def handle_remove_doc(
     vault_root: str,
     config: dict[str, Any],
     project: str = "default",
+    auth_user: str | None = None,
 ) -> dict[str, Any]:
     """Un-ingest a document: remove every trace of one raw doc from a project.
 
@@ -218,6 +347,7 @@ def handle_remove_doc(
         )
     vault_dir = _vault_dir(vault_root)
     db = _ensure_db(vault_root)
+    _authorize(db, project, auth_user, "editor")
     raw_collection = config["qdrant"]["collections"]["raw"]
     wiki_collection = config["qdrant"]["collections"]["wiki"]
 
@@ -290,7 +420,8 @@ def handle_remove_doc(
     }
 
 
-def handle_reindex(project: str, vault_root: str, config: dict[str, Any]) -> dict[str, Any]:
+def handle_reindex(project: str, vault_root: str, config: dict[str, Any],
+                   auth_user: str | None = None) -> dict[str, Any]:
     """Rebuild a project from its raw files: force re-ingest every raw doc (backfills
     Qdrant payloads after a schema change), tear down the compiled wiki so it can't
     do a minimal-update over stale content, then recompile everything fresh.
@@ -300,6 +431,7 @@ def handle_reindex(project: str, vault_root: str, config: dict[str, Any]) -> dic
     """
     validate_project(project)
     db = _ensure_db(vault_root)
+    _authorize(db, project, auth_user, "editor")
     raw_paths = list_raw_paths(db, project)
     if not raw_paths:
         logger.info("Reindex: no raw docs in project %s", project)
@@ -355,10 +487,16 @@ def handle_query(
     session_id: str | None = None,
     prior_context: list[str] | None = None,
     project: str = "default",
+    auth_user: str | None = None,
 ) -> dict[str, Any]:
-    """Answer a question within a project. No lock needed — read-only."""
+    """Answer a question within a project. No lock needed — read-only.
+
+    user_id is the answer-style identity (client-chosen, personalisation);
+    auth_user is the TRUSTED identity used for the access check (never trust
+    the client-supplied user_id for authorization)."""
     validate_project(project)
-    _ensure_db(vault_root)
+    db = _ensure_db(vault_root)
+    _authorize(db, project, auth_user, "viewer")
     return run_query(
         question=question,
         user_id=user_id,
@@ -371,13 +509,14 @@ def handle_query(
 
 
 def handle_lint(vault_root: str, config: dict[str, Any], project: str = "default",
-                semantic: bool | None = None) -> dict[str, Any]:
+                semantic: bool | None = None, auth_user: str | None = None) -> dict[str, Any]:
     """Run lint checks for a project. The Linter is read-only — no lock needed (see pkms_seq_lint.md).
 
     semantic: opt-in LLM audit (contradictions/coherence/stubs). None → config
     lint.llm_audit (default off). The auto post-compile lint leaves it None."""
     validate_project(project)
     db = _ensure_db(vault_root)
+    _authorize(db, project, auth_user, "viewer")
     result = run_lint(vault_root=vault_root, db_path=db, config=config, project=project,
                       semantic=semantic)
     logger.info("Lint: %d issues — %s", result["total_issues"], result["report_path"])
@@ -539,6 +678,19 @@ def main() -> None:
     p_lint.add_argument("--semantic", action="store_true",
                         help="also run the LLM semantic audit (contradictions/coherence/stubs; costs LLM calls)")
 
+    # member (B4 (4)) — project role management; CLI is the trusted-local admin path
+    p_member = sub.add_parser("member", help="Manage project members (owner/editor/viewer roles)")
+    msub = p_member.add_subparsers(dest="member_action", required=True)
+    m_add = msub.add_parser("add", help="Add a member (or update their role)")
+    m_add.add_argument("user_id", help="User identifier (matches the proxy-supplied X-Auth-User)")
+    m_add.add_argument("--project", type=normalize_project, default="default", help="Project (default: default)")
+    m_add.add_argument("--role", choices=list(ROLES), required=True, help="Role to grant")
+    m_rm = msub.add_parser("remove", help="Remove a member")
+    m_rm.add_argument("user_id", help="User identifier to remove")
+    m_rm.add_argument("--project", type=normalize_project, default="default", help="Project (default: default)")
+    m_ls = msub.add_parser("list", help="List members of a project")
+    m_ls.add_argument("--project", type=normalize_project, default="default", help="Project (default: default)")
+
     # watch
     sub.add_parser("watch", help="Watch vault/raw/ for new/changed files")
 
@@ -605,6 +757,26 @@ def main() -> None:
         result = handle_lint(vault_root=vault_root, config=config, project=args.project,
                              semantic=(args.semantic or None))
         print(f"[DONE] {result['total_issues']} issue(s) — {result['report_path']}")
+
+    elif args.verb == "member":
+        # CLI runs as the trusted-local admin (auth_user=None → full access).
+        result = handle_member(
+            args.member_action, args.project, vault_root, config,
+            user_id=getattr(args, "user_id", None),
+            role=getattr(args, "role", None),
+            auth_user=None,
+        )
+        if args.member_action == "list":
+            members = result["members"]
+            if not members:
+                print(f"project '{result['project']}': no members (unclaimed / open)")
+            else:
+                print(f"project '{result['project']}' members:")
+                for m in members:
+                    print(f"  {m['user_id']:<24} {m['role']}")
+        else:
+            print(f"[{result['status']}] {result['project']}: {result['user_id']}"
+                  + (f" → {result['role']}" if result.get("role") else ""))
 
     elif args.verb == "watch":
         handle_watch(vault_root=vault_root, config=config)

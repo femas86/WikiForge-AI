@@ -1,0 +1,77 @@
+<div class="card">
+  <div class="card-title">
+    Members of <code>{{ project }}</code>
+    {% if not claimed %}<span class="badge badge-warn">unclaimed · open</span>
+    {% elif my_role %}<span class="badge">you: {{ my_role }}</span>{% endif %}
+  </div>
+
+  {% if error %}<div class="alert alert-error"><strong>Error:</strong> {{ error }}</div>{% endif %}
+  {% if notice %}<div class="alert alert-success">{{ notice }}</div>{% endif %}
+
+  {% if denied %}
+  <div class="alert alert-warn">
+    You are not a member of <code>{{ project }}</code>, so its roster is hidden.
+    Ask an owner to add you.
+  </div>
+  {% elif members %}
+  <table class="members-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+    <thead>
+      <tr style="text-align:left;color:var(--muted);font-size:13px">
+        <th style="padding:6px 8px">User</th>
+        <th style="padding:6px 8px">Role</th>
+        {% if can_manage %}<th style="padding:6px 8px"></th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for m in members %}
+      <tr style="border-top:1px solid var(--border)">
+        <td style="padding:6px 8px">{{ m.user_id }}</td>
+        <td style="padding:6px 8px">{{ m.role }}</td>
+        {% if can_manage %}
+        <td style="padding:6px 8px;text-align:right">
+          <button class="btn btn-small"
+                  hx-post="/ui/members/remove"
+                  hx-target="#members-panel" hx-swap="innerHTML"
+                  hx-confirm="Remove {{ m.user_id }} from {{ project }}?"
+                  hx-vals='{"project": "{{ project }}", "user_id": "{{ m.user_id }}"}'>
+            Remove
+          </button>
+        </td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">No members yet — this project is open to everyone.</p>
+  {% endif %}
+
+  {% if can_claim %}
+  <form hx-post="/ui/members/add" hx-target="#members-panel" hx-swap="innerHTML"
+        hx-disabled-elt="button[type=submit]">
+    <input type="hidden" name="project" value="{{ project }}">
+    <input type="hidden" name="user_id" value="{{ auth_user }}">
+    <input type="hidden" name="role" value="owner">
+    <button type="submit" class="btn btn-primary">Claim project (become owner as <code>{{ auth_user }}</code>)</button>
+    <p class="hint">Claiming assigns you as owner and turns on role enforcement for this project.</p>
+  </form>
+  {% elif can_manage %}
+  <form hx-post="/ui/members/add" hx-target="#members-panel" hx-swap="innerHTML"
+        hx-disabled-elt="button[type=submit]" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+    <input type="hidden" name="project" value="{{ project }}">
+    <div class="field" style="margin:0">
+      <label for="member-user">Add user</label>
+      <input type="text" id="member-user" name="user_id" placeholder="user id" required
+             pattern="[a-zA-Z0-9._\-]+">
+    </div>
+    <div class="field" style="margin:0">
+      <label for="member-role">Role</label>
+      <select id="member-role" name="role">
+        {% for r in roles %}<option value="{{ r }}"{% if r == 'viewer' %} selected{% endif %}>{{ r }}</option>{% endfor %}
+      </select>
+    </div>
+    <button type="submit" class="btn btn-primary">Add</button>
+  </form>
+  <p class="hint">Adding an existing user updates their role.</p>
+  {% endif %}
+</div>

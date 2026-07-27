@@ -5,10 +5,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pkms.querier import (
+    _fit_prompt,
     _format_hits,
+    _greedy_fit,
+    _index_slug_only,
     _mem0_recall,
     _mem0_store,
     _parse_llm_response,
+    _reduce_index,
     query,
 )
 
@@ -355,3 +359,129 @@ def test_mem0_store_calls_add_with_user_and_metadata():
     assert kwargs["metadata"]["type"] == "qa_interaction"
     assert kwargs["metadata"]["project"] == "og-mdai"
     assert kwargs["metadata"]["sources"] == ["src#0"]
+
+
+# ── 1.13 prompt budgeting ───────────────────────────────────────────────────────
+
+def _big_index(n: int) -> str:
+    return "\n".join(f"- [[art-{i}]] — Summary sentence number {i} about a topic." for i in range(n)) + "\n"
+
+
+def test_greedy_fit_keeps_prefix_within_budget():
+    items = ["aaaa", "bbbb", "cccc"]  # ~1 token each (len//4)
+    kept, used = _greedy_fit(items, lambda s: len(s) // 4 or 1, budget=2)
+    assert kept == ["aaaa", "bbbb"]
+    assert used <= 2
+
+
+def test_greedy_fit_empty_and_none():
+    assert _greedy_fit([], len, 10) == ([], 0)
+    assert _greedy_fit(None, len, 10) == ([], 0)
+
+
+def test_index_slug_only_drops_summaries_keeps_all_slugs():
+    idx = "- [[alpha]] — long summary here\n- [[beta]] — another summary\n"
+    out = _index_slug_only(idx)
+    assert out == "- [[alpha]]\n- [[beta]]"
+    assert "summary" not in out
+
+
+def test_reduce_index_untouched_when_it_fits():
+    idx = "- [[alpha]] — s\n"
+    fitted, action = _reduce_index(idx, budget=10_000)
+    assert fitted == idx
+    assert action is None
+
+
+def test_reduce_index_falls_back_to_slug_only():
+    idx = _big_index(50)
+    # Budget big enough for slug-only but not the full summaries.
+    slug_tokens = len(_index_slug_only(idx)) // 4
+    fitted, action = _reduce_index(idx, budget=slug_tokens + 5)
+    assert action == "slug_only"
+    assert "Summary sentence" not in fitted
+    assert "[[art-0]]" in fitted and "[[art-49]]" in fitted
+
+
+def test_reduce_index_truncates_with_marker_when_tiny_budget():
+    idx = _big_index(200)
+    fitted, action = _reduce_index(idx, budget=20)
+    assert action.startswith("truncated")
+    assert "more articles omitted" in fitted
+    assert "[[art-0]]" in fitted  # highest-priority (first) slugs survive
+
+
+def test_reduce_index_dropped_when_no_room():
+    fitted, action = _reduce_index(_big_index(10), budget=0)
+    assert action == "dropped"
+    assert "omitted" in fitted
+
+
+def test_reduce_index_ignores_placeholder():
+    fitted, action = _reduce_index("(wiki index not available)", budget=1)
+    assert action is None
+
+
+def test_fit_prompt_drops_index_before_chunks():
+    # A pathologically large index must be trimmed while both hits survive.
+    wiki, raw, prior, index, dropped = _fit_prompt(
+        "question", "(none)", WIKI_HITS, RAW_HITS, [], _big_index(500),
+        {"query": {"max_prompt_tokens": 1500}},
+    )
+    assert len(wiki) == len(WIKI_HITS)   # curated hits preserved
+    assert len(raw) == len(RAW_HITS)
+    assert "index" in dropped            # index was the thing cut
+    assert "wiki_hits" not in dropped
+
+
+def test_fit_prompt_noop_when_everything_fits():
+    wiki, raw, prior, index, dropped = _fit_prompt(
+        "q", "(none)", WIKI_HITS, RAW_HITS, ["one prior line"], "- [[alpha]] — s\n",
+        {"query": {"max_prompt_tokens": 6000}},
+    )
+    assert dropped == {}
+    assert index == "- [[alpha]] — s\n"
+    assert prior == ["one prior line"]
+
+
+def test_fit_prompt_drops_lowest_priority_first():
+    # Budget sized to fit the fixed scaffold + exactly the wiki hit, nothing more:
+    # wiki (highest priority) must survive while raw + prior + index are dropped.
+    from pkms.querier import _SYNTHESIS_PROMPT, _estimate_tokens
+    fixed = _estimate_tokens(_SYNTHESIS_PROMPT) + _estimate_tokens("q") + _estimate_tokens("(none)")
+    wiki_cost = _estimate_tokens(_format_hits([WIKI_HITS[0]]))
+    budget = fixed + wiki_cost + 2  # room for the wiki hit, not the raw hit
+    wiki, raw, prior, _, dropped = _fit_prompt(
+        "q", "(none)", WIKI_HITS, RAW_HITS, [], _big_index(100),
+        {"query": {"max_prompt_tokens": budget}},
+    )
+    assert len(wiki) == len(WIKI_HITS)      # curated wiki (highest priority) preserved
+    assert raw == []                        # raw dropped before touching wiki
+    assert dropped["raw_hits"] == len(RAW_HITS)
+    assert "index" in dropped               # index (lowest priority) reduced/dropped
+    assert "wiki_hits" not in dropped
+
+
+def test_query_trims_large_index_end_to_end(tmp_path):
+    (tmp_path / "vault" / "default" / "wiki" / "articles").mkdir(parents=True)
+    (tmp_path / "vault" / "default" / "outputs").mkdir(parents=True)
+    (tmp_path / "vault" / "default" / "wiki" / "_index.md").write_text(_big_index(1000))
+    captured = []
+
+    def capture(agent, prompt, config, system=None):
+        captured.append(prompt)
+        return LLM_ANSWER
+
+    cfg = {**CONFIG, "query": {**CONFIG["query"], "max_prompt_tokens": 1200}}
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", side_effect=capture), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert"):
+        query("What is a Transformer?", "alice", str(tmp_path), cfg, session_id="big")
+
+    # The full 1000-line index would blow the budget; the assembled prompt must
+    # stay bounded and the wiki chunk must survive.
+    assert len(captured[0]) // 4 < 1200 + 500  # prompt tokens under budget + slack
+    assert "self-attention" in captured[0]     # wiki chunk preserved

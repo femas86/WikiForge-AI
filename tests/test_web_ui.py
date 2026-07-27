@@ -6,7 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import pkms.web as web_module
-from pkms.web import app
+from pkms.web import app, get_config, get_vault_root
+from tests._webdi import _override
 
 CLIENT = TestClient(app, raise_server_exceptions=False)
 
@@ -67,8 +68,8 @@ def test_ingest_page_returns_html():
 
 
 def test_status_page_returns_html(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.httpx.get", side_effect=ConnectionError):
         resp = CLIENT.get("/ui/status")
     assert resp.status_code == 200
@@ -78,8 +79,8 @@ def test_status_page_returns_html(tmp_path):
 
 
 def test_status_page_shows_api_key_missing(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.httpx.get", side_effect=ConnectionError), \
          patch("pkms.web.os.environ.get", return_value=None):
         resp = CLIENT.get("/ui/status")
@@ -87,8 +88,8 @@ def test_status_page_shows_api_key_missing(tmp_path):
 
 
 def test_status_page_shows_api_key_set(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.httpx.get", side_effect=ConnectionError), \
          patch("pkms.web.os.environ.get", return_value="sk-ant-test"):
         resp = CLIENT.get("/ui/status")
@@ -98,8 +99,8 @@ def test_status_page_shows_api_key_set(tmp_path):
 # ── HTMX fragment: /ui/query ──────────────────────────────────────────────────
 
 def test_ui_query_returns_answer_html(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=QUERY_RESULT):
         resp = CLIENT.post("/ui/query", data={"text": "What are transformers?", "user_id": "alice"})
     assert resp.status_code == 200
@@ -108,8 +109,8 @@ def test_ui_query_returns_answer_html(tmp_path):
 
 
 def test_ui_query_renders_markdown_placeholder(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=QUERY_RESULT):
         resp = CLIENT.post("/ui/query", data={"text": "Q?", "user_id": "alice"})
     # data-markdown attribute present for client-side rendering
@@ -117,8 +118,8 @@ def test_ui_query_renders_markdown_placeholder(tmp_path):
 
 
 def test_ui_query_shows_sources(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=QUERY_RESULT):
         resp = CLIENT.post("/ui/query", data={"text": "Q?", "user_id": "alice"})
     assert "transformers.md" in resp.text
@@ -126,16 +127,16 @@ def test_ui_query_shows_sources(tmp_path):
 
 def test_ui_query_shows_raw_only_warning(tmp_path):
     result = {**QUERY_RESULT, "coverage": "raw_only"}
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=result):
         resp = CLIENT.post("/ui/query", data={"text": "Q?", "user_id": "alice"})
     assert "pkms compile" in resp.text
 
 
 def test_ui_query_error_returns_alert(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", side_effect=RuntimeError("embed failed")):
         resp = CLIENT.post("/ui/query", data={"text": "Q?", "user_id": "alice"})
     assert resp.status_code == 200  # HTMX always 200
@@ -144,8 +145,8 @@ def test_ui_query_error_returns_alert(tmp_path):
 
 
 def test_ui_query_error_escapes_html(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", side_effect=RuntimeError('<script>alert(1)</script>')):
         resp = CLIENT.post("/ui/query", data={"text": "Q?", "user_id": "alice"})
     assert "<script>alert(1)</script>" not in resp.text
@@ -181,8 +182,8 @@ def _consume_stream(job_id: str) -> str:
 # ── HTMX fragment: /ui/ingest/url ────────────────────────────────────────────
 
 def test_ui_ingest_url_returns_stream_fragment(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT):
         resp = CLIENT.post("/ui/ingest/url", data={"url": "https://arxiv.org/abs/1706.03762"})
         assert resp.status_code == 200
@@ -196,8 +197,8 @@ def test_ui_ingest_url_returns_stream_fragment(tmp_path):
 
 def test_ui_ingest_url_skipped(tmp_path):
     skipped = {**INGEST_RESULT, "status": "SKIPPED"}
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=skipped):
         resp = CLIENT.post("/ui/ingest/url", data={"url": "https://arxiv.org/abs/1706.03762"})
         raw = _consume_stream(_extract_job_id(resp.text))
@@ -206,8 +207,8 @@ def test_ui_ingest_url_skipped(tmp_path):
 
 
 def test_ui_ingest_url_error_streams_error_card(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", side_effect=ConnectionError("fetch failed")):
         resp = CLIENT.post("/ui/ingest/url", data={"url": "https://example.com/paper.pdf"})
         raw = _consume_stream(_extract_job_id(resp.text))
@@ -216,8 +217,8 @@ def test_ui_ingest_url_error_streams_error_card(tmp_path):
 
 
 def test_ui_ingest_url_invalid_project_immediate_error(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG):
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG):
         resp = CLIENT.post("/ui/ingest/url",
                            data={"url": "https://x.org/p.pdf", "project": "../bad"})
     assert "alert-error" in resp.text  # no job spawned
@@ -228,8 +229,8 @@ def test_ui_ingest_url_invalid_project_immediate_error(tmp_path):
 
 def test_ui_ingest_file_success(tmp_path):
     (tmp_path / "vault" / "default" / "raw").mkdir(parents=True)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT):
         resp = CLIENT.post(
             "/ui/ingest/file",
@@ -243,8 +244,8 @@ def test_ui_ingest_file_success(tmp_path):
 def test_ui_ingest_file_traversal_stays_in_raw(tmp_path):
     (tmp_path / "vault" / "default" / "raw").mkdir(parents=True)
     (tmp_path / "vault" / "default" / "wiki").mkdir(parents=True)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT):
         resp = CLIENT.post(
             "/ui/ingest/file",
@@ -257,8 +258,8 @@ def test_ui_ingest_file_traversal_stays_in_raw(tmp_path):
 
 def test_ingest_file_endpoint_traversal_stays_in_raw(tmp_path):
     (tmp_path / "vault" / "default" / "raw").mkdir(parents=True)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT):
         resp = CLIENT.post(
             "/ingest/file",
@@ -271,8 +272,8 @@ def test_ingest_file_endpoint_traversal_stays_in_raw(tmp_path):
 
 def test_ui_ingest_file_error_streams_error_card(tmp_path):
     (tmp_path / "vault" / "default" / "raw").mkdir(parents=True)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", side_effect=RuntimeError("parse error")):
         resp = CLIENT.post(
             "/ui/ingest/file",
@@ -287,8 +288,8 @@ def test_ui_ingest_file_error_streams_error_card(tmp_path):
 # ── project routing ──────────────────────────────────────────────────────────
 
 def test_ingest_file_endpoint_creates_new_project(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT) as mock_i:
         resp = CLIENT.post(
             "/ingest/file",
@@ -301,8 +302,8 @@ def test_ingest_file_endpoint_creates_new_project(tmp_path):
 
 
 def test_ingest_file_endpoint_rejects_invalid_project(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG):
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG):
         resp = CLIENT.post(
             "/ingest/file",
             data={"project": "../escape"},
@@ -335,7 +336,7 @@ def _make_wiki(tmp_path, project="default"):
 
 def test_wiki_index_lists_articles(tmp_path):
     _make_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki")
     assert resp.status_code == 200
     assert "Transformer Architecture" in resp.text
@@ -345,7 +346,7 @@ def test_wiki_index_lists_articles(tmp_path):
 
 def test_wiki_index_empty_project(tmp_path):
     (tmp_path / "vault").mkdir()
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki")
     assert resp.status_code == 200
     assert "No compiled articles" in resp.text
@@ -358,7 +359,7 @@ def test_wiki_index_shows_pending_compile(tmp_path):
     init_db(db)
     upsert_file(db, path="vault/default/raw/new.pdf", hash="sha256:x",
                 qdrant_ids=["i"], collection="raw", indexed_at="t", project="default")
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki")
     assert "Not yet compiled" in resp.text
     assert "vault/default/raw/new.pdf" in resp.text
@@ -366,7 +367,7 @@ def test_wiki_index_shows_pending_compile(tmp_path):
 
 def test_wiki_article_renders_body_and_meta(tmp_path):
     _make_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki/default/transformers")
     assert resp.status_code == 200
     assert "Transformer Architecture" in resp.text
@@ -386,14 +387,14 @@ def test_wiki_article_shows_sources_from_db(tmp_path):
     upsert_article_source(db, wiki_path="vault/default/wiki/articles/transformers.md",
                           raw_path="vault/default/raw/attention.pdf",
                           compile_hash="sha256:a", compiled_at="t")
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki/default/transformers")
     assert "vault/default/raw/attention.pdf" in resp.text
 
 
 def test_wiki_article_missing_returns_404(tmp_path):
     _make_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki/default/nonexistent")
     assert resp.status_code == 404
 
@@ -401,7 +402,7 @@ def test_wiki_article_missing_returns_404(tmp_path):
 def test_wiki_article_slug_traversal_blocked(tmp_path):
     _make_wiki(tmp_path)
     (tmp_path / "vault" / "default" / "wiki" / "secret.md").write_text("hidden")
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         # encoded traversal reaches the route and must 404
         for slug in ("..%2Fsecret", ".%2E"):
             resp = CLIENT.get(f"/wiki/default/{slug}")
@@ -412,7 +413,7 @@ def test_wiki_article_slug_traversal_blocked(tmp_path):
 
 
 def test_wiki_article_invalid_project_404(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki/UPPER/anything")
     assert resp.status_code == 404
 
@@ -423,8 +424,8 @@ def test_nav_contains_wiki_link():
 
 
 def test_ingest_file_normalizes_project_case(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT) as mock_i:
         resp = CLIENT.post(
             "/ingest/file",
@@ -543,8 +544,8 @@ def test_settings_page_user_select_has_new_option(tmp_path):
 # ── "Trasforma in nota" (promote answer → raw/) ───────────────────────────────
 
 def test_promote_writes_note_and_ingests(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web._spawn_ingest_job", return_value="job-xyz") as mock_job:
         resp = CLIENT.post("/ui/promote", data={
             "question": "What is attention?",
@@ -565,8 +566,8 @@ def test_promote_writes_note_and_ingests(tmp_path):
 
 
 def test_promote_rejects_invalid_project(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web._spawn_ingest_job") as mock_job:
         resp = CLIENT.post("/ui/promote", data={
             "question": "q", "answer_md": "a", "sources": "", "title": "t",
@@ -596,7 +597,7 @@ def _make_graph_wiki(tmp_path, project="default"):
 
 def test_wiki_graph_data(tmp_path):
     _make_graph_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki/graph/data?project=default")
     assert resp.status_code == 200
     data = resp.json()
@@ -649,7 +650,7 @@ def test_wiki_link_graph_caches_until_articles_change(tmp_path):
 
 def test_wiki_graph_page_renders(tmp_path):
     _make_graph_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki/graph?project=default")
     assert resp.status_code == 200
     assert "Wiki graph" in resp.text
@@ -658,7 +659,7 @@ def test_wiki_graph_page_renders(tmp_path):
 
 def test_article_shows_backlinks(tmp_path):
     _make_graph_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki/default/alpha")
     assert resp.status_code == 200
     assert "Linked from" in resp.text
@@ -668,7 +669,7 @@ def test_article_shows_backlinks(tmp_path):
 
 def test_wiki_tag_filter(tmp_path):
     _make_graph_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/wiki?project=default&tag=extra")
     assert resp.status_code == 200
     # beta + gamma carry 'extra'; alpha does not → its title is filtered out
@@ -732,7 +733,7 @@ def test_recover_uncompiled_noop_without_db(tmp_path):
 
 def test_wiki_graph_data_toggle_params(tmp_path):
     _make_graph_wiki(tmp_path)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         both_off = CLIENT.get("/wiki/graph/data?project=default&concepts=0&tags=0").json()
         assert {n["type"] for n in both_off["nodes"]} == {"article"}
         concepts_only = CLIENT.get("/wiki/graph/data?project=default&concepts=1&tags=0").json()
@@ -745,8 +746,26 @@ def test_wiki_graph_concept_dedup(tmp_path):
     arts.mkdir(parents=True)
     (arts / "a.md").write_text("---\ntitle: A\n---\nSee [[energy-based-model]].\n")
     (arts / "b.md").write_text("---\ntitle: B\n---\nSee [[Energy Based Model]] and [[energy-based model]].\n")
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         d = CLIENT.get("/wiki/graph/data?project=default").json()
     concepts = [n for n in d["nodes"] if n["type"] == "concept"]
     assert len(concepts) == 1                       # 3 variants collapse to 1 node
     assert concepts[0]["id"] == "concept:energy-based-model"
+
+
+# ── B4 guards: web layer maps AccessDenied → 403 ───────────────────────────────
+
+def test_ui_query_forbidden_for_non_member_on_claimed_project(tmp_path):
+    from pkms.db import init_db, add_member
+    (tmp_path / "vault").mkdir()
+    db = str(tmp_path / "vault" / ".search-index")
+    init_db(db)
+    add_member(db, "demo", "alice", "owner", "t0")   # project is now claimed
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG):
+        # bob (via the trusted header) is not a member → denied before any query runs
+        resp = CLIENT.post("/ui/query",
+                           data={"text": "q?", "user_id": "bob", "project": "demo"},
+                           headers={"X-Auth-User": "bob"})
+    assert resp.status_code == 403
+    assert "Forbidden" in resp.text

@@ -64,6 +64,19 @@ def init_db(db_path: str) -> None:
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- B4 multi-user: per-project membership + role (owner/editor/viewer).
+            -- The user_id is whatever the trusted auth header (or the dev default)
+            -- resolves to; this table only holds the authorization role.
+            CREATE TABLE IF NOT EXISTS project_members (
+                project   TEXT NOT NULL,
+                user_id   TEXT NOT NULL,
+                role      TEXT NOT NULL,
+                added_at  TEXT NOT NULL,
+                PRIMARY KEY (project, user_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_project_members_user
+                ON project_members(user_id);
         """)
         # Migration for pre-project databases: add the column if missing.
         # The project index is created here (not in the script above) so it
@@ -274,3 +287,62 @@ def get_config(db_path: str, key: str) -> str | None:
     row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
     conn.close()
     return row["value"] if row else None
+
+
+# ── project_members (B4 multi-user) ─────────────────────────────────────────────
+
+def add_member(db_path: str, project: str, user_id: str, role: str, added_at: str) -> None:
+    """Add a user to a project with a role, or update their role if already a member."""
+    conn = _connect(db_path)
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO project_members (project, user_id, role, added_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(project, user_id) DO UPDATE SET role = excluded.role
+            """,
+            (project, user_id, role, added_at),
+        )
+    conn.close()
+
+
+def remove_member(db_path: str, project: str, user_id: str) -> None:
+    conn = _connect(db_path)
+    with conn:
+        conn.execute(
+            "DELETE FROM project_members WHERE project = ? AND user_id = ?",
+            (project, user_id),
+        )
+    conn.close()
+
+
+def get_member_role(db_path: str, project: str, user_id: str) -> str | None:
+    """The user's role in the project, or None if not a member."""
+    conn = _connect(db_path)
+    row = conn.execute(
+        "SELECT role FROM project_members WHERE project = ? AND user_id = ?",
+        (project, user_id),
+    ).fetchone()
+    conn.close()
+    return row["role"] if row else None
+
+
+def list_members(db_path: str, project: str) -> list[dict[str, str]]:
+    conn = _connect(db_path)
+    rows = conn.execute(
+        "SELECT user_id, role, added_at FROM project_members WHERE project = ? ORDER BY user_id",
+        (project,),
+    ).fetchall()
+    conn.close()
+    return [{"user_id": r["user_id"], "role": r["role"], "added_at": r["added_at"]} for r in rows]
+
+
+def list_user_projects(db_path: str, user_id: str) -> list[str]:
+    """Projects the user is a member of (any role)."""
+    conn = _connect(db_path)
+    rows = conn.execute(
+        "SELECT project FROM project_members WHERE user_id = ? ORDER BY project",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [r["project"] for r in rows]

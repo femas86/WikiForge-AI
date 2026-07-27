@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Members{% endblock %}
+{% block heading %}Members{% endblock %}
+{% block subheading %}Per-project roles · owner &gt; editor &gt; viewer{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-title">Project</div>
+  <div class="field" style="max-width:260px">
+    <label for="project-select">Project</label>
+    <select id="project-select" onchange="window.location='/members?project='+encodeURIComponent(this.value)">
+      {% for p in projects %}<option value="{{ p }}"{% if p == project %} selected{% endif %}>{{ p }}</option>{% endfor %}
+    </select>
+    <p class="hint">
+      Roles: <strong>viewer</strong> reads &amp; queries · <strong>editor</strong> ingests, compiles,
+      removes · <strong>owner</strong> also manages members. A project with no members is
+      <strong>open</strong> to everyone until someone claims it.
+    </p>
+  </div>
+</div>
+
+<div id="members-panel">
+  {% include "members_panel.html" %}
+</div>
+{% endblock %}

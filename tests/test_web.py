@@ -6,7 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import pkms.web as web_module
-from pkms.web import app
+from pkms.web import app, get_config, get_vault_root
+from tests._webdi import _override
 
 CLIENT = TestClient(app, raise_server_exceptions=False)
 
@@ -37,7 +38,7 @@ CFG = {
 # ── /status ───────────────────────────────────────────────────────────────────
 
 def test_status_returns_200(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/status")
     assert resp.status_code == 200
     body = resp.json()
@@ -53,7 +54,7 @@ def test_status_db_exists_true(tmp_path):
     (vault_dir / "raw").mkdir()
     (vault_dir / "wiki").mkdir()
     (vault_dir / "outputs").mkdir()
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path):
+    with _override(get_vault_root, lambda: str(tmp_path)):
         resp = CLIENT.get("/status")
     body = resp.json()
     assert body["db_exists"] is True
@@ -63,8 +64,8 @@ def test_status_db_exists_true(tmp_path):
 # ── POST /query ───────────────────────────────────────────────────────────────
 
 def test_query_happy_path(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
         resp = CLIENT.post("/query", json={"text": "What are transformers?", "user_id": "alice"})
 
@@ -77,8 +78,8 @@ def test_query_happy_path(tmp_path):
 
 
 def test_query_passes_user_id(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
         CLIENT.post("/query", json={"text": "Q?", "user_id": "bob"})
 
@@ -87,8 +88,8 @@ def test_query_passes_user_id(tmp_path):
 
 
 def test_query_passes_session_id(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
         CLIENT.post("/query", json={"text": "Q?", "user_id": "a", "session_id": "ses-42"})
 
@@ -107,8 +108,8 @@ def test_query_missing_text_returns_422(tmp_path):
 
 
 def test_query_handler_exception_returns_500(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", side_effect=RuntimeError("embed service down")):
         resp = CLIENT.post("/query", json={"text": "Q?", "user_id": "alice"})
     assert resp.status_code == 500
@@ -117,8 +118,8 @@ def test_query_handler_exception_returns_500(tmp_path):
 # ── POST /ingest (URL) ────────────────────────────────────────────────────────
 
 def test_ingest_url_happy_path(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT) as mock_i:
         resp = CLIENT.post("/ingest", json={"url": "https://arxiv.org/abs/1234.5678"})
 
@@ -127,13 +128,13 @@ def test_ingest_url_happy_path(tmp_path):
     assert body["status"] == "DONE"
     assert body["n_chunks"] == 5
     mock_i.assert_called_once_with(
-        "https://arxiv.org/abs/1234.5678", str(tmp_path), CFG, project="default"
+        "https://arxiv.org/abs/1234.5678", str(tmp_path), CFG, project="default", auth_user="local"
     )
 
 
 def test_ingest_url_exception_returns_500(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", side_effect=ConnectionError("fetch failed")):
         resp = CLIENT.post("/ingest", json={"url": "https://example.com/paper.pdf"})
     assert resp.status_code == 500
@@ -148,8 +149,8 @@ def test_ingest_url_missing_field_returns_422(tmp_path):
 
 def test_ingest_file_happy_path(tmp_path):
     (tmp_path / "vault" / "raw").mkdir(parents=True)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT) as mock_i:
         file_bytes = b"%PDF fake content"
         resp = CLIENT.post(
@@ -169,8 +170,8 @@ def test_ingest_file_happy_path(tmp_path):
 
 def test_ingest_file_exception_returns_500(tmp_path):
     (tmp_path / "vault" / "raw").mkdir(parents=True)
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", side_effect=RuntimeError("parse failed")):
         resp = CLIENT.post(
             "/ingest/file",
@@ -189,8 +190,8 @@ def test_ingest_file_no_file_returns_422(tmp_path):
 # misplace the compiled article while the DB recorded the correct project.
 
 def test_ingest_file_stores_vault_relative_path(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT) as mock_i:
         resp = CLIENT.post(
             "/ingest/file",
@@ -204,8 +205,8 @@ def test_ingest_file_stores_vault_relative_path(tmp_path):
 
 
 def test_ingest_file_stores_path_under_requested_project(tmp_path):
-    with patch.object(web_module, "_VAULT_ROOT", tmp_path), \
-         patch.object(web_module, "_get_config", return_value=CFG), \
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_ingest", return_value=INGEST_RESULT) as mock_i:
         resp = CLIENT.post(
             "/ingest/file",

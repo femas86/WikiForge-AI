@@ -137,11 +137,29 @@ lint:
   # marker the prompt is told to ignore (so the clip isn't mistaken for a defect).
   # semantic_body_chars: 6000
 
+# ── AUTH (B4 multi-user) ─────────────────────────────────────────────────────
+auth:
+  # Identity is delegated to a reverse-proxy / SSO in front of the app, which
+  # sets this trusted header with the authenticated user id. The app only reads
+  # it — the header SOURCE (oauth2-proxy, an IdP, or nothing in dev) depends on
+  # the deployment. WARNING: only expose the app behind that proxy in production;
+  # a client could otherwise set the header itself.
+  user_header: X-Auth-User
+  # Fallback user when no header is present (dev / single-user / CLI).
+  default_user: local
+
 # ── QUERY ────────────────────────────────────────────────────────────────────
 query:
   top_k_wiki:  4                 # chunks retrieved from wiki collection (cut 8→4: keep the query
   top_k_raw:   4                 # prompt under Groq free-tier 8000 TPM, incl. the 4096 output budget)
   mem0_recall: 5                 # prior interactions recalled per query
+  # Hard bound on the assembled synthesis prompt (1.13). When over budget the
+  # querier trims in priority order — wiki > raw > prior_context > index (the
+  # index reduces full → slug-only → truncated) — and logs what it dropped,
+  # instead of letting a large wiki's _index.md silently overflow the window.
+  # Default 6000 preserves the top_k=4+4 setup above; free-tier Groq users who
+  # must fit 8000 TPM (≈3900 prompt after the 4096 output) can lower it.
+  max_prompt_tokens: 6000
 
 # ── LOCK ─────────────────────────────────────────────────────────────────────
 lock:

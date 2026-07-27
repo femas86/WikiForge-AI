@@ -11,7 +11,7 @@ from typing import Any
 from pkms import metrics
 from pkms.embed import embed
 from pkms.guards import guard_write, validate_project
-from pkms.ingestor import chunk
+from pkms.ingestor import chunk, _estimate_tokens
 from pkms.llm import complete
 from pkms.qdrant_store import point_id, search, upsert
 from pkms.memory import get_provider
@@ -127,6 +127,121 @@ def _format_hits(hits: list[dict[str, Any]]) -> str:
         header = f"[{path}#{idx}]" + (f" {heading}" if heading else "")
         lines.append(f"{header}\n{text}")
     return "\n\n".join(lines)
+
+
+# ── prompt budgeting (1.13) ────────────────────────────────────────────────────
+# The synthesis prompt used to be assembled with no token bound: retrieved chunks
+# + the FULL _index.md + prior_context + user_instructions, straight into
+# .format(). A large wiki makes _index.md alone (one line per article) saturate
+# the context window → the backend rejects it, or worse silently truncates and
+# drops the tail so the answer looks valid but is half-grounded. The compiler
+# bounds both sides (map-reduce input, sectioned output); this is the query-side
+# twin. We fit the variable components under query.max_prompt_tokens in priority
+# order — wiki > raw > prior_context > index — and log whatever we drop.
+
+_DEFAULT_QUERY_BUDGET = 6000
+
+
+def _greedy_fit(items: list, cost_of, budget: int) -> tuple[list, int]:
+    """Keep a prefix of `items` (assumed most-important-first) whose summed cost
+    stays within budget. Returns (kept, tokens_used)."""
+    kept: list = []
+    used = 0
+    for it in items or []:
+        cost = cost_of(it)
+        if used + cost > budget:
+            break
+        kept.append(it)
+        used += cost
+    return kept, used
+
+
+def _index_slug_only(index_md: str) -> str:
+    """Reduce a full `- [[slug]] — summary` index to slug-only `- [[slug]]` lines:
+    keeps the complete navigation map (every article still citable) but drops the
+    prose summaries. Non-article lines are dropped."""
+    out = []
+    for line in index_md.splitlines():
+        s = line.strip()
+        if s.startswith("- [["):
+            end = s.find("]]")
+            out.append(s[: end + 2] if end != -1 else s)
+    return "\n".join(out)
+
+
+def _reduce_index(index_md: str, budget: int) -> tuple[str, str | None]:
+    """Fit the index into `budget` tokens. Returns (fitted_index, action) where
+    action is None (untouched), 'slug_only', 'truncated (<n> omitted)' or
+    'dropped' — the second element is for logging only."""
+    if not index_md or index_md.startswith("(wiki index"):
+        return index_md, None
+    if budget <= 0:
+        return "(wiki index omitted — no room in context budget)", "dropped"
+    if _estimate_tokens(index_md) <= budget:
+        return index_md, None
+    slug = _index_slug_only(index_md)
+    if slug and _estimate_tokens(slug) <= budget:
+        return slug, "slug_only"
+    # Still too big: truncate the slug list and mark the omission explicitly.
+    lines = slug.splitlines()
+    kept, _ = _greedy_fit(lines, _estimate_tokens, budget)
+    omitted = len(lines) - len(kept)
+    if not kept:
+        return "(wiki index omitted — no room in context budget)", "dropped"
+    marker = f"\n… ({omitted} more articles omitted — index truncated to fit context budget)"
+    return "\n".join(kept) + marker, f"truncated ({omitted} omitted)"
+
+
+def _fit_prompt(
+    question: str,
+    user_instructions: str,
+    wiki_hits: list[dict[str, Any]],
+    raw_hits: list[dict[str, Any]],
+    prior_context: list[str],
+    index_md: str,
+    config: dict[str, Any],
+) -> tuple[list, list, list, str, dict[str, Any]]:
+    """Trim the variable synthesis-prompt components to fit query.max_prompt_tokens.
+    Priority (highest first, so the lowest is dropped first): wiki hits > raw hits
+    > prior_context > index. Returns the fitted components plus a `dropped` dict
+    describing what was cut (empty when everything fit)."""
+    budget = config.get("query", {}).get("max_prompt_tokens", _DEFAULT_QUERY_BUDGET)
+    # Fixed cost: the template scaffolding + the question + the style block are
+    # never dropped (cutting the question or instructions would corrupt the task).
+    fixed = (
+        _estimate_tokens(_SYNTHESIS_PROMPT)
+        + _estimate_tokens(question)
+        + _estimate_tokens(user_instructions or "")
+    )
+    avail = max(0, budget - fixed)
+    dropped: dict[str, Any] = {}
+
+    # Retrieval hits are score-sorted (defensive re-sort) so the greedy prefix
+    # always keeps the highest-scoring chunks and drops the weakest first.
+    wiki_hits = sorted(wiki_hits or [], key=lambda h: h.get("score", 0), reverse=True)
+    raw_hits = sorted(raw_hits or [], key=lambda h: h.get("score", 0), reverse=True)
+    hit_cost = lambda h: _estimate_tokens(_format_hits([h]))
+
+    wiki_kept, used_w = _greedy_fit(wiki_hits, hit_cost, avail)
+    if len(wiki_kept) < len(wiki_hits):
+        dropped["wiki_hits"] = len(wiki_hits) - len(wiki_kept)
+    rem = avail - used_w
+
+    raw_kept, used_r = _greedy_fit(raw_hits, hit_cost, rem)
+    if len(raw_kept) < len(raw_hits):
+        dropped["raw_hits"] = len(raw_hits) - len(raw_kept)
+    rem -= used_r
+
+    prior_kept, used_p = _greedy_fit(prior_context, _estimate_tokens, rem)
+    if len(prior_kept) < len(prior_context or []):
+        dropped["prior_context"] = len(prior_context) - len(prior_kept)
+    rem -= used_p
+
+    index_fit, index_action = _reduce_index(index_md, rem)
+    if index_action:
+        dropped["index"] = index_action
+
+    return wiki_kept, raw_kept, prior_kept, index_fit, dropped
 
 
 def _parse_llm_response(raw: str) -> tuple[str, list[str], str]:
@@ -252,8 +367,18 @@ def query(
             with metrics.timer("memory_recall", provider=provider.name):
                 prior_context = provider.recall(question, user_id, config)
 
-        prior_text = "\n".join(prior_context) if prior_context else "(none)"
         user_instructions = load_user_style(user_id) or "(none)"
+
+        # Bound the assembled prompt to query.max_prompt_tokens (1.13): trim
+        # index/prior/chunks in priority order rather than letting a large wiki
+        # index or chunk set silently overflow (and get truncated by) the backend.
+        wiki_hits, raw_hits, prior_context, index_md, dropped = _fit_prompt(
+            question, user_instructions, wiki_hits, raw_hits, prior_context, index_md, config
+        )
+        if dropped:
+            logger.info("Query prompt trimmed to fit context budget: %s", dropped)
+
+        prior_text = "\n".join(prior_context) if prior_context else "(none)"
 
         # Synthesise answer
         prompt = _SYNTHESIS_PROMPT.format(
