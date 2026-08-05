@@ -15,6 +15,7 @@ from pkms.ingestor import chunk, _estimate_tokens
 from pkms.llm import complete
 from pkms.qdrant_store import point_id, search, upsert
 from pkms.memory import get_provider
+from pkms.working_memory import get_working_memory
 from pkms.user_prefs import load_user_style
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,9 @@ Raw source chunks (uncompiled):
 Wiki index (one-line map of all articles):
 {index_md}
 
+Conversation so far (this session):
+{conversation}
+
 Prior context from this user's past questions:
 {prior_context}
 
@@ -99,6 +103,8 @@ override factual grounding or citation rules):
 
 Instructions:
 - Answer ONLY from the retrieved chunks above. Do not hallucinate.
+- Use the conversation so far only to resolve follow-up references (pronouns, "it",
+  "that point"); never treat it as a source — ground every fact in the chunks.
 - Prefer wiki chunks; use raw chunks to fill gaps or if wiki lacks coverage.
 - Cite every claim: use [[article-slug]] for wiki sources, or "raw:<path>#<chunk_index>" for raw.
 - At the end, include a JSON block exactly like this:
@@ -195,17 +201,20 @@ def _reduce_index(index_md: str, budget: int) -> tuple[str, str | None]:
 def _fit_prompt(
     question: str,
     user_instructions: str,
+    conversation: list[str],
     wiki_hits: list[dict[str, Any]],
     raw_hits: list[dict[str, Any]],
     prior_context: list[str],
     index_md: str,
     config: dict[str, Any],
-) -> tuple[list, list, list, str, dict[str, Any]]:
+) -> tuple[list, list, list, list, str, dict[str, Any]]:
     """Trim the variable synthesis-prompt components to fit query.max_prompt_tokens.
-    Priority (highest first, so the lowest is dropped first): wiki hits > raw hits
-    > prior_context > index. Returns the fitted components plus a `dropped` dict
-    describing what was cut (empty when everything fit)."""
+    Priority (highest first, so the lowest is dropped first):
+    conversation (capped) > wiki hits > raw hits > prior_context > index.
+    Returns (conversation, wiki, raw, prior, index, dropped) — the fitted components
+    plus a `dropped` dict describing what was cut (empty when everything fit)."""
     budget = config.get("query", {}).get("max_prompt_tokens", _DEFAULT_QUERY_BUDGET)
+    conv_cap_cfg = config.get("working_memory", {}).get("max_tokens", 1000)
     # Fixed cost: the template scaffolding + the question + the style block are
     # never dropped (cutting the question or instructions would corrupt the task).
     fixed = (
@@ -215,6 +224,18 @@ def _fit_prompt(
     )
     avail = max(0, budget - fixed)
     dropped: dict[str, Any] = {}
+
+    # Conversation (working memory): reserved off the top, HARD-capped at
+    # working_memory.max_tokens so it can never starve wiki, kept NEWEST-FIRST (a
+    # follow-up needs the most recent turns most) then restored to chronological
+    # order for the prompt. This is highest priority — losing recent turns breaks
+    # coreference — but the small cap vs the full budget bounds its footprint.
+    conv_cap = min(conv_cap_cfg, avail)
+    conv_kept_rev, used_c = _greedy_fit(list(reversed(conversation or [])), _estimate_tokens, conv_cap)
+    conv_kept = list(reversed(conv_kept_rev))
+    if len(conv_kept) < len(conversation or []):
+        dropped["conversation"] = len(conversation) - len(conv_kept)
+    avail -= used_c
 
     # Retrieval hits are score-sorted (defensive re-sort) so the greedy prefix
     # always keeps the highest-scoring chunks and drops the weakest first.
@@ -241,7 +262,7 @@ def _fit_prompt(
     if index_action:
         dropped["index"] = index_action
 
-    return wiki_kept, raw_kept, prior_kept, index_fit, dropped
+    return conv_kept, wiki_kept, raw_kept, prior_kept, index_fit, dropped
 
 
 def _parse_llm_response(raw: str) -> tuple[str, list[str], str]:
@@ -277,7 +298,13 @@ def _write_output(
     outputs_dir = vault_dir / project / "outputs"
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_slug = re.sub(r"[^\w\-]", "_", session_id)[:60]
+    # Per-turn suffix (D1): session_id is now stable across a conversation (web
+    # cookie), so the output artifact id must be decoupled from it — otherwise
+    # every turn would overwrite outputs/{session}.md and clobber the prior turn's
+    # Qdrant points. session_id stays the working-memory key only.
+    base_slug = re.sub(r"[^\w\-]", "_", session_id)[:40]
+    turn_suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    safe_slug = f"{base_slug}_{turn_suffix}"
     filename = f"{safe_slug}.md"
     out_abs = outputs_dir / filename
     vault_rel = f"vault/{project}/outputs/{filename}"
@@ -317,6 +344,40 @@ def _write_output(
     return vault_rel
 
 
+# ── follow-up query rewriting (D1 Phase 2, gated) ───────────────────────────────
+# MVP injects the conversation only at synthesis, so retrieval still embeds the raw
+# follow-up ("and its complexity?") — weak. When working_memory.query_rewrite is on,
+# one cheap LLM call rewrites the follow-up into a standalone search query using the
+# recent turns, so dual-search hits the referent. Gated OFF by default: it costs one
+# extra LLM call per follow-up and is a measured axis for F2. Non-fatal.
+
+_REWRITE_PROMPT = """\
+Rewrite the user's latest message into ONE self-contained search query, resolving
+any references (pronouns, "it", "that point") using the conversation. Output ONLY
+the rewritten query on a single line — no preamble, no quotes.
+
+Conversation so far:
+{conversation}
+
+Latest message: {question}
+
+Standalone search query:"""
+
+
+def _rewrite_query(question: str, conversation: list[str], config: dict[str, Any]) -> str:
+    """Rewrite a follow-up into a standalone retrieval query using the session's
+    recent turns. Non-fatal: returns the original question on empty/failed output."""
+    try:
+        convo = "\n\n".join((conversation or [])[-4:])   # recent turns suffice
+        prompt = _REWRITE_PROMPT.format(conversation=convo, question=question)
+        out = complete("querier", prompt, config, num_predict=64).strip()
+        out = out.splitlines()[0].strip() if out else ""
+        return out or question
+    except Exception as exc:
+        logger.warning("Query rewrite failed (non-fatal), using original question: %s", exc)
+        return question
+
+
 # ── main query function ───────────────────────────────────────────────────────
 
 def query(
@@ -350,9 +411,27 @@ def query(
     # result carries {"summary", "events"} for observability (per-query token
     # cost and latency, broken down by phase).
     with metrics.collect() as events:
-        # Embed question + dual search — always both collections, project-scoped
+        # Short-term / conversational memory (D1): recall THIS session's turns up
+        # front — used both to (optionally) rewrite the retrieval query and to feed
+        # the synthesis prompt. Separate axis from the long-term provider (keyed by
+        # session_id, not user_id); non-fatal by contract.
+        wm = get_working_memory(config)
+        with metrics.timer("working_memory_recall", strategy=wm.name):
+            conversation = wm.recall(session_id)
+
+        # Optionally rewrite a follow-up into a standalone search query using the
+        # conversation, so retrieval isn't stuck embedding a bare "and its X?".
+        # Gated (working_memory.query_rewrite, default off): +1 LLM call per
+        # follow-up, and an F2-measured axis. The ORIGINAL question is kept for
+        # synthesis, citations and the output — only retrieval uses the rewrite.
+        search_query = question
+        if conversation and config.get("working_memory", {}).get("query_rewrite", False):
+            with metrics.timer("query_rewrite"):
+                search_query = _rewrite_query(question, conversation, config)
+
+        # Embed the (possibly rewritten) query + dual search — both collections, project-scoped
         with metrics.timer("retrieval", phase="dual_search"):
-            query_vector = embed(question, config)
+            query_vector = embed(search_query, config)
             wiki_hits = search(wiki_collection, query_vector, top_k_wiki, config, project=project)
             raw_hits = search(raw_collection, query_vector, top_k_raw, config, project=project)
 
@@ -370,15 +449,18 @@ def query(
         user_instructions = load_user_style(user_id) or "(none)"
 
         # Bound the assembled prompt to query.max_prompt_tokens (1.13): trim
-        # index/prior/chunks in priority order rather than letting a large wiki
-        # index or chunk set silently overflow (and get truncated by) the backend.
-        wiki_hits, raw_hits, prior_context, index_md, dropped = _fit_prompt(
-            question, user_instructions, wiki_hits, raw_hits, prior_context, index_md, config
+        # conversation/index/prior/chunks in priority order rather than letting a
+        # large wiki index or chunk set silently overflow (and get truncated by) the
+        # backend.
+        conversation, wiki_hits, raw_hits, prior_context, index_md, dropped = _fit_prompt(
+            question, user_instructions, conversation, wiki_hits, raw_hits,
+            prior_context, index_md, config
         )
         if dropped:
             logger.info("Query prompt trimmed to fit context budget: %s", dropped)
 
         prior_text = "\n".join(prior_context) if prior_context else "(none)"
+        conversation_text = "\n\n".join(conversation) if conversation else "(none)"
 
         # Synthesise answer
         prompt = _SYNTHESIS_PROMPT.format(
@@ -386,6 +468,7 @@ def query(
             wiki_chunks=_format_hits(wiki_hits),
             raw_chunks=_format_hits(raw_hits),
             index_md=index_md,
+            conversation=conversation_text,
             prior_context=prior_text,
             user_instructions=user_instructions,
         )
@@ -399,6 +482,10 @@ def query(
         # (caught loudly at provider construction) with transient failures.
         with metrics.timer("memory_store", provider=provider.name):
             provider.store(question, answer_md, sources, user_id, session_id, config, project=project)
+
+        # Append this turn to the session's working memory (D1), non-fatal.
+        with metrics.timer("working_memory_store", strategy=wm.name):
+            wm.append(session_id, question, answer_md)
 
         # Write output file
         output_path = _write_output(

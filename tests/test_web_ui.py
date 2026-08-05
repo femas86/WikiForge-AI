@@ -769,3 +769,40 @@ def test_ui_query_forbidden_for_non_member_on_claimed_project(tmp_path):
                            headers={"X-Auth-User": "bob"})
     assert resp.status_code == 403
     assert "Forbidden" in resp.text
+
+
+# ── D1: conversation session cookie ────────────────────────────────────────────
+
+def test_query_page_sets_session_cookie_once():
+    from fastapi.testclient import TestClient as _TC
+    c = _TC(app)
+    r1 = c.get("/query")
+    assert r1.status_code == 200
+    sid = c.cookies.get("pkms_session")
+    assert sid  # minted on first GET
+    # second GET with the cookie present must NOT rotate it
+    c.get("/query")
+    assert c.cookies.get("pkms_session") == sid
+
+
+def test_ui_query_threads_session_id_from_cookie(tmp_path):
+    from fastapi.testclient import TestClient as _TC
+    c = _TC(app)
+    c.cookies.set("pkms_session", "sess-abc")
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
+         patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
+        r = c.post("/ui/query", data={"text": "follow up?", "user_id": "alice"})
+    assert r.status_code == 200
+    assert mock_q.call_args.kwargs["session_id"] == "sess-abc"
+
+
+def test_ui_query_session_id_none_when_cookie_absent(tmp_path):
+    from fastapi.testclient import TestClient as _TC
+    c = _TC(app)  # no GET, no cookie
+    with _override(get_vault_root, lambda: str(tmp_path)), \
+         _override(get_config, lambda: CFG), \
+         patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
+        r = c.post("/ui/query", data={"text": "q?", "user_id": "alice"})
+    assert r.status_code == 200
+    assert mock_q.call_args.kwargs["session_id"] is None

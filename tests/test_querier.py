@@ -13,6 +13,7 @@ from pkms.querier import (
     _mem0_store,
     _parse_llm_response,
     _reduce_index,
+    _rewrite_query,
     query,
 )
 
@@ -204,9 +205,11 @@ def test_query_writes_output_file(tmp_path):
         result = query("What is a Transformer?", "alice", str(tmp_path), CONFIG,
                        session_id="test_session")
 
-    out_file = tmp_path / "vault" / "default" / "outputs" / "test_session.md"
-    assert out_file.exists()
-    content = out_file.read_text()
+    # Output filename carries a per-turn suffix (D1) so a stable session_id can't
+    # overwrite prior turns — match the session-id prefix rather than an exact name.
+    outputs = list((tmp_path / "vault" / "default" / "outputs").glob("test_session_*.md"))
+    assert len(outputs) == 1
+    content = outputs[0].read_text()
     assert "What is a Transformer?" in content
     assert "self-attention" in content
 
@@ -424,8 +427,8 @@ def test_reduce_index_ignores_placeholder():
 
 def test_fit_prompt_drops_index_before_chunks():
     # A pathologically large index must be trimmed while both hits survive.
-    wiki, raw, prior, index, dropped = _fit_prompt(
-        "question", "(none)", WIKI_HITS, RAW_HITS, [], _big_index(500),
+    conv, wiki, raw, prior, index, dropped = _fit_prompt(
+        "question", "(none)", [], WIKI_HITS, RAW_HITS, [], _big_index(500),
         {"query": {"max_prompt_tokens": 1500}},
     )
     assert len(wiki) == len(WIKI_HITS)   # curated hits preserved
@@ -435,8 +438,8 @@ def test_fit_prompt_drops_index_before_chunks():
 
 
 def test_fit_prompt_noop_when_everything_fits():
-    wiki, raw, prior, index, dropped = _fit_prompt(
-        "q", "(none)", WIKI_HITS, RAW_HITS, ["one prior line"], "- [[alpha]] — s\n",
+    conv, wiki, raw, prior, index, dropped = _fit_prompt(
+        "q", "(none)", [], WIKI_HITS, RAW_HITS, ["one prior line"], "- [[alpha]] — s\n",
         {"query": {"max_prompt_tokens": 6000}},
     )
     assert dropped == {}
@@ -451,8 +454,8 @@ def test_fit_prompt_drops_lowest_priority_first():
     fixed = _estimate_tokens(_SYNTHESIS_PROMPT) + _estimate_tokens("q") + _estimate_tokens("(none)")
     wiki_cost = _estimate_tokens(_format_hits([WIKI_HITS[0]]))
     budget = fixed + wiki_cost + 2  # room for the wiki hit, not the raw hit
-    wiki, raw, prior, _, dropped = _fit_prompt(
-        "q", "(none)", WIKI_HITS, RAW_HITS, [], _big_index(100),
+    conv, wiki, raw, prior, _, dropped = _fit_prompt(
+        "q", "(none)", [], WIKI_HITS, RAW_HITS, [], _big_index(100),
         {"query": {"max_prompt_tokens": budget}},
     )
     assert len(wiki) == len(WIKI_HITS)      # curated wiki (highest priority) preserved
@@ -460,6 +463,21 @@ def test_fit_prompt_drops_lowest_priority_first():
     assert dropped["raw_hits"] == len(RAW_HITS)
     assert "index" in dropped               # index (lowest priority) reduced/dropped
     assert "wiki_hits" not in dropped
+
+
+def test_fit_prompt_conversation_capped_newest_first():
+    # Conversation is highest priority but capped: with a tiny cap only the newest
+    # turn(s) survive, and wiki is still retained.
+    convo = [f"Q: q{i}\nA: {'z'*400}" for i in range(6)]  # 6 turns, ~100 tok each
+    conv, wiki, raw, prior, index, dropped = _fit_prompt(
+        "q", "(none)", convo, WIKI_HITS, RAW_HITS, [], "- [[alpha]] — s\n",
+        {"query": {"max_prompt_tokens": 6000}, "working_memory": {"max_tokens": 250}},
+    )
+    assert 0 < len(conv) < len(convo)       # capped
+    assert conv[-1] == convo[-1]            # newest kept
+    assert convo[0] not in conv             # oldest dropped
+    assert dropped["conversation"] == len(convo) - len(conv)
+    assert len(wiki) == len(WIKI_HITS)      # wiki not starved by conversation
 
 
 def test_query_trims_large_index_end_to_end(tmp_path):
@@ -485,3 +503,146 @@ def test_query_trims_large_index_end_to_end(tmp_path):
     # stay bounded and the wiki chunk must survive.
     assert len(captured[0]) // 4 < 1200 + 500  # prompt tokens under budget + slack
     assert "self-attention" in captured[0]     # wiki chunk preserved
+
+
+# ── D1 working-memory integration ───────────────────────────────────────────────
+
+class _FakeWM:
+    """Minimal WorkingMemory double capturing appends."""
+    name = "window"
+    def __init__(self, turns=None): self._turns = turns or []; self.appended = []
+    def recall(self, session_id): return list(self._turns)
+    def append(self, session_id, question, answer): self.appended.append((session_id, question, answer))
+
+
+def test_query_injects_conversation_and_appends(tmp_path):
+    _setup_vault(tmp_path)
+    fake = _FakeWM(turns=["Q: What is Dijkstra?\nA: A shortest-path algorithm."])
+    captured = []
+    def capture(agent, prompt, config, system=None):
+        captured.append(prompt)
+        return LLM_ANSWER
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", side_effect=capture), \
+         patch("pkms.querier.get_working_memory", return_value=fake), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert"):
+        query("And its time complexity?", "alice", str(tmp_path), CONFIG, session_id="s1")
+    # prior turn reached the synthesis prompt under the conversation heading
+    assert "Conversation so far" in captured[0]
+    assert "A shortest-path algorithm." in captured[0]
+    # the new turn was appended with the stable session id
+    assert fake.appended == [("s1", "And its time complexity?", captured and _answer_of(LLM_ANSWER))]
+
+
+def _answer_of(llm_answer):
+    # answer_md is the text before the trailing ```json block
+    return llm_answer.split("```json")[0].strip()
+
+
+def test_query_working_memory_nonfatal(tmp_path):
+    _setup_vault(tmp_path)
+    class _Boom:
+        name = "window"
+        def recall(self, s): raise RuntimeError("recall boom")
+        def append(self, s, q, a): raise RuntimeError("append boom")
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER), \
+         patch("pkms.querier.get_working_memory", return_value=_Boom()), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert"):
+        # recall raising must not break the query (the real WindowBuffer swallows,
+        # but even a misbehaving buffer should not take the query down)
+        with pytest.raises(RuntimeError):
+            query("q?", "alice", str(tmp_path), CONFIG, session_id="s2")
+
+
+# ── D1 Phase 2: query rewriting (gated) ─────────────────────────────────────────
+
+def test_rewrite_query_uses_rewritten_output():
+    convo = ["Q: What is Dijkstra?\nA: A shortest-path algorithm."]
+    with patch("pkms.querier.complete", return_value="time complexity of Dijkstra's algorithm"):
+        out = _rewrite_query("and its complexity?", convo, CONFIG)
+    assert out == "time complexity of Dijkstra's algorithm"
+
+
+def test_rewrite_query_empty_output_falls_back_to_original():
+    with patch("pkms.querier.complete", return_value="   "):
+        out = _rewrite_query("and its complexity?", ["Q: x\nA: y"], CONFIG)
+    assert out == "and its complexity?"
+
+
+def test_rewrite_query_takes_first_line_only():
+    with patch("pkms.querier.complete", return_value="line one\nline two"):
+        out = _rewrite_query("q?", ["Q: x\nA: y"], CONFIG)
+    assert out == "line one"
+
+
+def test_rewrite_query_non_fatal_on_error():
+    with patch("pkms.querier.complete", side_effect=RuntimeError("boom")):
+        out = _rewrite_query("and its complexity?", ["Q: x\nA: y"], CONFIG)
+    assert out == "and its complexity?"   # fell back, no raise
+
+
+def _rewrite_cfg(on: bool):
+    return {**CONFIG, "working_memory": {"strategy": "window", "query_rewrite": on}}
+
+
+def test_query_gated_off_embeds_original_question(tmp_path):
+    _setup_vault(tmp_path)
+    fake = _FakeWM(turns=["Q: What is Dijkstra?\nA: A shortest-path algorithm."])
+    embed_mock = MagicMock(return_value=[0.1, 0.2, 0.3, 0.4])
+    with patch("pkms.querier.embed", embed_mock), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER) as mock_c, \
+         patch("pkms.querier.get_working_memory", return_value=fake), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert"):
+        query("and its complexity?", "alice", str(tmp_path), _rewrite_cfg(False), session_id="s1")
+    # default/off: no rewrite call → complete used once (synthesis only); retrieval
+    # embedded the ORIGINAL follow-up.
+    assert mock_c.call_count == 1
+    assert embed_mock.call_args_list[0][0][0] == "and its complexity?"
+
+
+def test_query_gated_on_embeds_rewritten_query(tmp_path):
+    _setup_vault(tmp_path)
+    fake = _FakeWM(turns=["Q: What is Dijkstra?\nA: A shortest-path algorithm."])
+    embed_mock = MagicMock(return_value=[0.1, 0.2, 0.3, 0.4])
+    prompts = []
+    def fake_complete(agent, prompt, config, num_predict=None, response_format=None):
+        prompts.append(prompt)
+        return "time complexity of Dijkstra" if len(prompts) == 1 else LLM_ANSWER
+    with patch("pkms.querier.embed", embed_mock), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", side_effect=fake_complete), \
+         patch("pkms.querier.get_working_memory", return_value=fake), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert"):
+        query("and its complexity?", "alice", str(tmp_path), _rewrite_cfg(True), session_id="s1")
+    # rewrite fired: retrieval embedded the REWRITTEN query...
+    assert embed_mock.call_args_list[0][0][0] == "time complexity of Dijkstra"
+    # ...but synthesis (2nd complete) still saw the ORIGINAL question.
+    assert "and its complexity?" in prompts[1]
+
+
+def test_query_rewrite_skipped_when_no_conversation(tmp_path):
+    _setup_vault(tmp_path)
+    fake = _FakeWM(turns=[])   # empty buffer → nothing to resolve
+    embed_mock = MagicMock(return_value=[0.1, 0.2, 0.3, 0.4])
+    with patch("pkms.querier.embed", embed_mock), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER) as mock_c, \
+         patch("pkms.querier.get_working_memory", return_value=fake), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert"):
+        query("first question", "alice", str(tmp_path), _rewrite_cfg(True), session_id="s1")
+    assert mock_c.call_count == 1   # rewrite skipped (empty buffer) even though gated on
+    assert embed_mock.call_args_list[0][0][0] == "first question"

@@ -45,11 +45,32 @@ ollama:
   embed_batch_size:       32   # texts per /api/embed request — concurrency is server-side
                                # (OLLAMA_NUM_PARALLEL in docker-compose.yml), the client just batches
 
-# Querier long-term memory provider (pluggable).
+# Querier long-term memory provider (pluggable), keyed by user_id.
 # none = baseline · mem0 = managed Mem0 · amem = local Zettelkasten · mempalace = spatial/zero-LLM.
 # Set to mem0 to re-enable memory recall in the product.
 memory:
   provider: none
+
+# Querier short-term / conversational (working) memory (D1). A SEPARATE, orthogonal
+# axis from `memory` above: keyed by session_id (the current conversation), it holds
+# the recent verbatim turns so a follow-up ("and its complexity?") can be resolved.
+# strategy: none reproduces the stateless baseline (F2 control); window keeps the last
+# `max_turns` turns per session, in-process. Injected into the synthesis prompt (capped
+# at max_tokens, highest priority in the 1.13 budget) — never used as a grounding source.
+working_memory:
+  strategy:   window   # none | window   (future: summary)
+  max_turns:  6        # ring-buffer depth per session
+  max_tokens: 1000     # hard cap on the conversation slice injected into the prompt
+  ttl:        3600     # seconds of inactivity before a session buffer is evicted
+  # Rewrite a follow-up into a standalone SEARCH query using the conversation, so
+  # retrieval isn't stuck embedding a bare "and its X?". OFF by default: it costs
+  # one extra LLM call per follow-up (and is a measured axis for the F2 study). The
+  # original question is always kept for synthesis/citations — only retrieval uses
+  # the rewrite. This is a SECOND, separately-toggleable use of the buffer (the
+  # first is synthesis-prompt injection, always on with strategy=window) — hence a
+  # distinct flag, NOT because it's independent of `strategy`: it consumes the
+  # buffer, so with strategy=none there's nothing to rewrite from and it no-ops.
+  query_rewrite: false
 
 mem0:
   # Managed Mem0 platform (app.mem0.ai). Credential is read from the
@@ -165,13 +186,6 @@ query:
 lock:
   ttl_seconds:      300          # lock expires after 5 min (crash safety)
   max_wait_seconds: 60           # give up acquiring lock after 1 min
-
-# ── AGENT POOL ───────────────────────────────────────────────────────────────
-agent_pool:
-  max_concurrent_ingestors: 4
-  max_concurrent_compilers: 1
-  max_concurrent_queriers:  4
-  max_concurrent_linters:   1
 
 # ── WATCHER ──────────────────────────────────────────────────────────────────
 watcher:

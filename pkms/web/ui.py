@@ -4,6 +4,7 @@ os, _get_uncompiled_raw_paths) are reached via `web.<name>` at request time so
 patch("pkms.web.<name>") still targets them; the rest is imported by name.
 """
 import sqlite3
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +49,19 @@ def root():
 def ui_query_page(request: Request, projects: list[str] = Depends(get_projects)):
     cookie_user = request.cookies.get("pkms_user") or "default"
     users = sorted(set(list_users()) | {cookie_user})  # current user always selectable
-    return templates.TemplateResponse(request, "query.html", {
+    resp = templates.TemplateResponse(request, "query.html", {
         "active":       "query",
         "projects":     projects,
         "users":        users,
         "current_user": cookie_user,
     })
+    # Conversation continuity (D1): ensure a stable per-browser session id exists
+    # BEFORE the HTMX POST, so working memory can thread follow-ups. Mirrors the
+    # pkms_user cookie. A "new conversation" reset (rotate this cookie) is future.
+    if not request.cookies.get("pkms_session"):
+        resp.set_cookie("pkms_session", uuid.uuid4().hex,
+                        max_age=60 * 60 * 24 * 7, samesite="lax")
+    return resp
 
 
 @router.get("/ingest", response_class=HTMLResponse)
@@ -317,6 +325,7 @@ def ui_query_fragment(
             user_id=user_id,
             vault_root=vault_root,
             config=config,
+            session_id=request.cookies.get("pkms_session"),  # D1: thread conversation (None → auto)
             project=normalize_project(project),
             auth_user=auth_user,
         )
