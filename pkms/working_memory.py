@@ -4,13 +4,13 @@ This is a SEPARATE axis from the long-term `MemoryProvider` (pkms.memory): worki
 memory is keyed by `session_id` and holds the recent verbatim turns of the CURRENT
 conversation, so a bare follow-up ("and its complexity?") can be resolved. The
 long-term provider is keyed by `user_id` and does cross-session semantic recall —
-the two are orthogonal and combine freely (e.g. baseline `memory.provider=none` +
+the two are orthogonal and combine freely (e.g. `memory.provider=none` +
 `working_memory.strategy=window` still gets follow-up continuity).
 
 Selected via `working_memory.strategy` in pkms.config.yaml, mirroring
 `pkms.memory.get_provider`. The `window` buffer is in-process (module-level dict +
 lock + inactivity eviction, modeled on pkms.events) — single-process and
-non-persistent, which is fine for the single-process F2 runner and for dev; a
+non-persistent, which is fine for a single-process deployment and for dev; a
 persistent (SQLite) strategy is a documented future option.
 """
 
@@ -46,8 +46,8 @@ class WorkingMemory(Protocol):
 
 
 class NoneBuffer:
-    """No working memory — reproduces the stateless per-turn behaviour. This is the
-    F2 control arm (short-term axis OFF)."""
+    """No working memory — reproduces the stateless per-turn behaviour
+    (short-term memory OFF)."""
 
     name = "none"
     healthy = True

@@ -545,6 +545,17 @@ def reconcile_projects(vault_root: str, config: dict[str, Any]) -> int:
     return total
 
 
+def handle_export_okf(vault_root: str, config: dict[str, Any], project: str = "default",
+                      out: str | None = None) -> dict[str, Any]:
+    """Export a project's compiled wiki as an OKF v0.1 bundle (Open Knowledge Format,
+    Google Cloud). Read-only: the canonical wiki, linter, link-graph and querier are
+    untouched — OKF is a second, opt-in representation. Defaults out to <vault>/okf/<project>."""
+    from pkms.okf_export import export_okf
+    validate_project(project)
+    out_dir = out or str(Path(vault_root) / "okf" / project)
+    return export_okf(Path(vault_root) / "vault", project, out_dir)
+
+
 def _watcher_ready_path() -> Path:
     return Path.home() / ".pkms" / "watcher.ready"
 
@@ -603,21 +614,6 @@ def handle_watch(vault_root: str, config: dict[str, Any]) -> None:
         print("Watcher stopped.", flush=True)
 
 
-def handle_benchmark(dataset: str, provider: str, vault_root: str, config: dict[str, Any], limit: int = 5) -> dict[str, Any]:
-    """Run standard evaluation benchmarks on memory providers.
-
-    The evaluation harness (pkms/benchmark.py) is optional and may not be
-    present in every build; fail with a clear message instead of a raw
-    ImportError when it is absent."""
-    try:
-        from pkms.benchmark import run_benchmark
-    except ImportError as exc:
-        raise RuntimeError(
-            "The evaluation harness (pkms/benchmark.py) is not included in this build."
-        ) from exc
-    config_copy = dict(config)
-    config_copy["vault"] = {"root": str(Path(vault_root) / "vault")}
-    return run_benchmark(dataset_name=dataset, provider_name=provider, config=config_copy, limit=limit)
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
@@ -678,6 +674,13 @@ def main() -> None:
     p_lint.add_argument("--semantic", action="store_true",
                         help="also run the LLM semantic audit (contradictions/coherence/stubs; costs LLM calls)")
 
+    p_okf = sub.add_parser("export-okf",
+                           help="Export the wiki as an Open Knowledge Format (OKF v0.1) bundle")
+    p_okf.add_argument("--project", type=normalize_project, default="default",
+                       help="Project whose wiki to export (default: default)")
+    p_okf.add_argument("--out", default=None,
+                       help="Output directory for the OKF bundle (default: <vault>/okf/<project>)")
+
     # member (B4 (4)) — project role management; CLI is the trusted-local admin path
     p_member = sub.add_parser("member", help="Manage project members (owner/editor/viewer roles)")
     msub = p_member.add_subparsers(dest="member_action", required=True)
@@ -700,11 +703,6 @@ def main() -> None:
     p_serve.add_argument("--port", type=int, default=None, help="Bind port (default: $PKMS_PORT or 8000)")
     p_serve.add_argument("--reload", action="store_true", help="Enable auto-reload (dev mode)")
 
-    # benchmark
-    p_bench = sub.add_parser("benchmark", help="Run standard memory evaluations")
-    p_bench.add_argument("--dataset", choices=["locomo", "longmem", "all"], default="all", help="Dataset to evaluate (default: all)")
-    p_bench.add_argument("--provider", choices=["none", "mem0", "amem", "mempalace"], required=True, help="Memory provider to evaluate")
-    p_bench.add_argument("--limit", type=int, default=5, help="Limit number of evaluation samples")
 
     args = parser.parse_args()
 
@@ -758,6 +756,12 @@ def main() -> None:
                              semantic=(args.semantic or None))
         print(f"[DONE] {result['total_issues']} issue(s) — {result['report_path']}")
 
+    elif args.verb == "export-okf":
+        result = handle_export_okf(vault_root=vault_root, config=config,
+                                   project=args.project, out=args.out)
+        print(f"[DONE] OKF v{result['okf_version']} — {result['n_articles']} article(s) → "
+              f"{result['out_dir']}")
+
     elif args.verb == "member":
         # CLI runs as the trusted-local admin (auth_user=None → full access).
         result = handle_member(
@@ -785,12 +789,10 @@ def main() -> None:
         from pkms.web import serve
         serve(host=args.host, port=args.port, reload=args.reload)
 
-    elif args.verb == "benchmark":
-        datasets = ["locomo", "longmem"] if args.dataset == "all" else [args.dataset]
-        for ds in datasets:
-            print(f"Running memory benchmark '{ds}' with provider '{args.provider}'...")
-            res = handle_benchmark(ds, args.provider, vault_root, config, limit=args.limit)
-            print(f"[BENCHMARK] Dataset: {ds} | Provider: {args.provider}")
-            print(f"  Total Queries: {res['total_queries']}")
-            print(f"  Avg Accuracy:  {res['average_accuracy']:.2f}")
-            print(f"  Avg Latency:   {res['average_latency_seconds']:.2f}s")
+
+
+if __name__ == "__main__":
+    # Fallback entry point so `python -m pkms.coordinator <verb> …` works even when
+    # the console script `pkms` isn't installed (e.g. no [build-system] → uv sync
+    # installs deps only). The `pkms` script, when installed, calls main() directly.
+    main()

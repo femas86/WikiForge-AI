@@ -316,6 +316,24 @@ def remove_member(db_path: str, project: str, user_id: str) -> None:
     conn.close()
 
 
+def delete_project_rows(db_path: str, project: str) -> None:
+    """Remove all .search-index rows belonging to a project — files, its
+    article_sources, and membership — in one call (e.g. to tear down a throwaway
+    project). article_sources has no project column, so its rows are matched by the
+    `vault/<project>/` path prefix their wiki_path/raw_path carry.
+    """
+    prefix = f"vault/{project}/%"
+    conn = _connect(db_path)
+    with conn:
+        conn.execute("DELETE FROM files WHERE project = ?", (project,))
+        conn.execute(
+            "DELETE FROM article_sources WHERE wiki_path LIKE ? OR raw_path LIKE ?",
+            (prefix, prefix),
+        )
+        conn.execute("DELETE FROM project_members WHERE project = ?", (project,))
+    conn.close()
+
+
 def get_member_role(db_path: str, project: str, user_id: str) -> str | None:
     """The user's role in the project, or None if not a member."""
     conn = _connect(db_path)

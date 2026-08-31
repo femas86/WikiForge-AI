@@ -349,7 +349,7 @@ def _write_output(
 # follow-up ("and its complexity?") — weak. When working_memory.query_rewrite is on,
 # one cheap LLM call rewrites the follow-up into a standalone search query using the
 # recent turns, so dual-search hits the referent. Gated OFF by default: it costs one
-# extra LLM call per follow-up and is a measured axis for F2. Non-fatal.
+# extra LLM call per follow-up. Non-fatal.
 
 _REWRITE_PROMPT = """\
 Rewrite the user's latest message into ONE self-contained search query, resolving
@@ -388,11 +388,30 @@ def query(
     session_id: str | None = None,
     prior_context: list[str] | None = None,
     project: str = "default",
+    use_wiki: bool = True,
+    use_memory: bool = True,
+    store_memory: bool | None = None,
+    write_output: bool = True,
+    temperature: float | None = None,
 ) -> dict[str, Any]:
     """Answer a question using dual search over one project's wiki + raw chunks.
 
     prior_context: list of prior memory strings (passed by Coordinator from Mem0 recall).
     Returns result dict with answer_md, sources, coverage, output_path.
+
+    The retrieval and memory channels can be toggled independently (at their
+    defaults the behaviour is unchanged):
+      - use_wiki:  False skips BOTH wiki and raw retrieval (and the _index.md read)
+                   → question-only context.
+      - use_memory: False disables the long-term provider entirely — no recall AND
+                   no store — regardless of what the caller passed.
+      - store_memory: gates ONLY the store; None → follows use_memory (product default:
+                   recall+store together). The F2 eval sets it False at PROBE time so a
+                   probe recalls but does NOT write its own Q&A back into memory —
+                   otherwise probes contaminate the store and couple runs (a probe is the
+                   measurement, not part of the conversation to memorise).
+      - write_output: False skips the per-turn output artifact.
+      - temperature: forwarded to the synthesis call (None keeps the backend default).
     """
     validate_project(project)
     if session_id is None:
@@ -422,27 +441,36 @@ def query(
         # Optionally rewrite a follow-up into a standalone search query using the
         # conversation, so retrieval isn't stuck embedding a bare "and its X?".
         # Gated (working_memory.query_rewrite, default off): +1 LLM call per
-        # follow-up, and an F2-measured axis. The ORIGINAL question is kept for
+        # follow-up. The ORIGINAL question is kept for
         # synthesis, citations and the output — only retrieval uses the rewrite.
         search_query = question
         if conversation and config.get("working_memory", {}).get("query_rewrite", False):
             with metrics.timer("query_rewrite"):
                 search_query = _rewrite_query(question, conversation, config)
 
-        # Embed the (possibly rewritten) query + dual search — both collections, project-scoped
-        with metrics.timer("retrieval", phase="dual_search"):
-            query_vector = embed(search_query, config)
-            wiki_hits = search(wiki_collection, query_vector, top_k_wiki, config, project=project)
-            raw_hits = search(raw_collection, query_vector, top_k_raw, config, project=project)
-
-        # Load _index.md (non-fatal if missing)
-        index_path = vault_dir / project / "wiki" / "_index.md"
-        index_md = index_path.read_text(encoding="utf-8") if index_path.exists() else "(wiki index not available)"
+        # Embed the (possibly rewritten) query + dual search — both collections, project-scoped.
+        # use_wiki=False skips the whole document channel: no retrieval,
+        # no _index.md — the prompt scaffolding stays identical, only the chunks are empty.
+        if use_wiki:
+            with metrics.timer("retrieval", phase="dual_search"):
+                query_vector = embed(search_query, config)
+                wiki_hits = search(wiki_collection, query_vector, top_k_wiki, config, project=project)
+                raw_hits = search(raw_collection, query_vector, top_k_raw, config, project=project)
+            # Load _index.md (non-fatal if missing)
+            index_path = vault_dir / project / "wiki" / "_index.md"
+            index_md = index_path.read_text(encoding="utf-8") if index_path.exists() else "(wiki index not available)"
+        else:
+            wiki_hits, raw_hits = [], []
+            index_md = "(wiki index not available)"
 
         # Memory recall via the configured provider (none|mem0|…), if the
-        # Coordinator didn't already pass prior_context.
+        # Coordinator didn't already pass prior_context. use_memory=False forces the
+        # long-term axis off entirely: no recall here and
+        # no store below, regardless of what the caller passed.
         provider = get_provider(config)
-        if prior_context is None:
+        if not use_memory:
+            prior_context = []
+        elif prior_context is None:
             with metrics.timer("memory_recall", provider=provider.name):
                 prior_context = provider.recall(question, user_id, config)
 
@@ -473,24 +501,38 @@ def query(
             user_instructions=user_instructions,
         )
         with metrics.timer("synthesis"):
-            raw_response = complete("querier", prompt, config)
+            # forward temperature only when set, so existing callers (and tests that
+            # patch complete() with an (agent, prompt, config, ...) signature) are unaffected
+            _synth_kw = {} if temperature is None else {"temperature": temperature}
+            # query.num_predict caps the OUTPUT reservation (unset in the product → the
+            # backend default; the F2 eval sets it to slash the per-call token cost that
+            # Groq bills as input + reserved max_tokens)
+            _np = (config.get("query") or {}).get("num_predict")
+            if _np:
+                _synth_kw["num_predict"] = _np
+            raw_response = complete("querier", prompt, config, **_synth_kw)
         answer_md, sources, coverage = _parse_llm_response(raw_response)
 
         # Store interaction via the configured provider. Non-fatality is the
         # provider's contract (see MemoryProvider.store) — every provider wraps its
         # own backend calls; no second net here that would blur misconfiguration
         # (caught loudly at provider construction) with transient failures.
-        with metrics.timer("memory_store", provider=provider.name):
-            provider.store(question, answer_md, sources, user_id, session_id, config, project=project)
+        # Skipped when use_memory=False (arm off) or store_memory=False (F2 probe:
+        # recall-only, so a probe never writes its own answer back into memory and
+        # can't contaminate the store or couple runs).
+        do_store = use_memory if store_memory is None else store_memory
+        if do_store:
+            with metrics.timer("memory_store", provider=provider.name):
+                provider.store(question, answer_md, sources, user_id, session_id, config, project=project)
 
         # Append this turn to the session's working memory (D1), non-fatal.
         with metrics.timer("working_memory_store", strategy=wm.name):
             wm.append(session_id, question, answer_md)
 
-        # Write output file
+        # Write output file (skipped when write_output=False)
         output_path = _write_output(
             answer_md, question, sources, coverage, session_id, vault_dir, config, project
-        )
+        ) if write_output else None
 
     summary = metrics.summarize(events)
     logger.info(

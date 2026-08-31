@@ -46,7 +46,7 @@ ollama:
                                # (OLLAMA_NUM_PARALLEL in docker-compose.yml), the client just batches
 
 # Querier long-term memory provider (pluggable), keyed by user_id.
-# none = baseline · mem0 = managed Mem0 · amem = local Zettelkasten · mempalace = spatial/zero-LLM.
+# none = no memory · mem0 = managed Mem0 · amem = local note-linking · mempalace = local spatial.
 # Set to mem0 to re-enable memory recall in the product.
 memory:
   provider: none
@@ -54,7 +54,7 @@ memory:
 # Querier short-term / conversational (working) memory (D1). A SEPARATE, orthogonal
 # axis from `memory` above: keyed by session_id (the current conversation), it holds
 # the recent verbatim turns so a follow-up ("and its complexity?") can be resolved.
-# strategy: none reproduces the stateless baseline (F2 control); window keeps the last
+# strategy: none reproduces the stateless behaviour; window keeps the last
 # `max_turns` turns per session, in-process. Injected into the synthesis prompt (capped
 # at max_tokens, highest priority in the 1.13 budget) — never used as a grounding source.
 working_memory:
@@ -64,13 +64,14 @@ working_memory:
   ttl:        3600     # seconds of inactivity before a session buffer is evicted
   # Rewrite a follow-up into a standalone SEARCH query using the conversation, so
   # retrieval isn't stuck embedding a bare "and its X?". OFF by default: it costs
-  # one extra LLM call per follow-up (and is a measured axis for the F2 study). The
+  # one extra LLM call per follow-up. The
   # original question is always kept for synthesis/citations — only retrieval uses
   # the rewrite. This is a SECOND, separately-toggleable use of the buffer (the
   # first is synthesis-prompt injection, always on with strategy=window) — hence a
   # distinct flag, NOT because it's independent of `strategy`: it consumes the
   # buffer, so with strategy=none there's nothing to rewrite from and it no-ops.
   query_rewrite: false
+
 
 mem0:
   # Managed Mem0 platform (app.mem0.ai). Credential is read from the
@@ -79,7 +80,7 @@ mem0:
   provider: managed
 
 mempalace:
-  # Spatial / zero-LLM-write memory. Heavy optional dep: pip install '.[mempalace]'.
+  # Local spatial memory. Heavy optional dep: pip install '.[mempalace]'.
   palace_path: ~/.pkms/mempalace
 
 # ── EMBEDDING ────────────────────────────────────────────────────────────────

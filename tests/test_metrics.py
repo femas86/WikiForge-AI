@@ -86,6 +86,8 @@ def test_call_groq_records_usage():
     from pkms.llm import _call_groq
     cfg = {"llm_router": {"models": {"groq": "openai/gpt-oss-120b"}}}
     resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {}
     resp.json.return_value = {
         "choices": [{"message": {"content": "ok"}}],
         "usage": {"prompt_tokens": 200, "completion_tokens": 80},

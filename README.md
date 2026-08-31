@@ -158,16 +158,16 @@ l'indicizzazione fallirà per mismatch dimensionale.
 
 ## Memoria del motore di query (configurabile)
 
-Il Querier può ricordare le interazioni passate per trasformare la ricerca in
-un'indagine cumulativa. Anche il backend di memoria è **pluggable**, via
+Il Querier può ricordare le interazioni passate, così una conversazione mantiene
+continuità tra una domanda e l'altra. Il backend di memoria è **pluggable**, via
 `memory.provider` in `pkms.config.yaml`:
 
 | Provider | Cosa | Richiede |
 |----------|------|----------|
 | `none` | nessuna memoria (default) | — |
 | `mem0` | memoria gestita ([app.mem0.ai](https://app.mem0.ai)) | `MEM0_API_KEY` + SDK `mem0` |
-| `amem` | Zettelkasten locale (SQLite) | `numpy` |
-| `mempalace` | memoria spaziale | `pip install '.[mempalace]'` |
+| `amem` | note collegate, locale (SQLite) | `numpy` |
+| `mempalace` | memoria spaziale locale | `pip install '.[mempalace]'` |
 
 Ogni provider implementa lo stesso contratto `recall()` / `store()`, così sostituirlo
 non tocca il Querier. Le precondizioni (chiave, SDK) sono validate all'avvio: un

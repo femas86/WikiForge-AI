@@ -11,6 +11,7 @@ dependencies = [
   "pdfminer.six",
   "pypdf",          # B6: fallback PDF extractor when pdfminer glues words
   "trafilatura",    # B6: main-content HTML extraction (drops nav/boilerplate/scripts)
+  "beautifulsoup4", # B6: HTML fallback parser (used by ingestor._parse_html)
   "fastapi",
   "uvicorn",
   "gitpython",
@@ -23,14 +24,29 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Heavy, local, zero-LLM-write memory provider (chromadb + onnx + a ~79MB model
+# Heavy, local spatial memory provider (chromadb + onnx + a ~79MB model
 # downloaded on first use). Only needed when memory.provider == mempalace.
 mempalace = ["mempalace"]
 
 [project.scripts]
 pkms = "pkms.coordinator:main"
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The repo root holds several top-level dirs (tests/, eval/, docs/, scripts/); name
+# the importable package explicitly so the build backend installs exactly `pkms/`
+# and `uv sync` creates the `pkms` console script.
+[tool.hatch.build.targets.wheel]
+packages = ["pkms"]
+
 [dependency-groups]
 dev = [
   "pytest",
+  # Spatial memory provider, kept in the DEV env so `uv sync` installs it once and
+  # never prunes it (pinned: it exposes an internal API — re-verify on upgrade, see
+  # docs/mempalace_sdk.md). NOT a runtime dep of the product — end users opt in via
+  # the [mempalace] extra above; this only affects local dev / F2 eval runs.
+  "mempalace==3.5.0",
 ]

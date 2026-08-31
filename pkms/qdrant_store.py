@@ -155,3 +155,22 @@ def delete_by_path(
     if n:
         client.delete(collection_name=collection, points_selector=FilterSelector(filter=flt))
     return n
+
+
+def delete_by_project(
+    collection: str,
+    project: str,
+    config: dict[str, Any],
+) -> int:
+    """Delete every point whose payload.project == project. Returns count deleted.
+
+    Mirrors delete_by_path but on the project keyword field — a single filtered
+    delete that drops all of one project's points at once (e.g. to tear down a
+    throwaway project), which the real vault never needs (documents leave one at a time).
+    """
+    client = _client(config)
+    flt = Filter(must=[FieldCondition(key="project", match=MatchValue(value=project))])
+    n = client.count(collection_name=collection, count_filter=flt, exact=True).count
+    if n:
+        client.delete(collection_name=collection, points_selector=FilterSelector(filter=flt))
+    return n

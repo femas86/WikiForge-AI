@@ -173,7 +173,7 @@ def test_query_returns_answer(tmp_path):
 
 
 def test_query_result_carries_phase_metrics(tmp_path):
-    """The result must expose the D-axis provenance the F2 harness reads:
+    """The result must expose per-phase metrics for observability/tooling:
     a summary (llm_calls/tokens/durations) plus per-phase timed events."""
     _setup_vault(tmp_path)
 
@@ -319,6 +319,120 @@ def test_query_mem0_store_failure_is_nonfatal(tmp_path):
                        session_id="s5")
 
     assert result["coverage"] == "full"
+
+
+# ── retrieval / memory toggle flags (use_wiki / use_memory / write_output) ──────
+
+def test_query_use_wiki_false_skips_retrieval(tmp_path):
+    """use_wiki=False: no wiki/raw retrieval and no query embedding — question only."""
+    _setup_vault(tmp_path)
+    search = MagicMock()
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", search), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert"):
+        result = query("Q?", "alice", str(tmp_path), CONFIG,
+                       session_id="arm_none", use_wiki=False, prior_context=[])
+
+    assert search.call_count == 0        # no dual search over wiki/raw
+    assert result["answer_md"]           # still answers (question-only)
+
+
+def test_query_use_memory_false_skips_recall_and_store(tmp_path):
+    """use_memory=False: long-term provider off — no recall, no store, even when
+    prior_context is None (which would normally trigger recall)."""
+    _setup_vault(tmp_path)
+    provider = MagicMock()
+    provider.name = "none"
+    provider.recall.return_value = ["SHOULD NOT BE USED"]
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER), \
+         patch("pkms.querier.get_provider", return_value=provider), \
+         patch("pkms.querier.upsert"):
+        result = query("Q?", "alice", str(tmp_path), CONFIG,
+                       session_id="arm_wiki", use_memory=False, prior_context=None)
+
+    provider.recall.assert_not_called()
+    provider.store.assert_not_called()
+    assert result["answer_md"]
+
+
+def test_query_use_memory_true_recalls_and_stores(tmp_path):
+    """use_memory=True (default): provider recall + store both fire."""
+    _setup_vault(tmp_path)
+    provider = MagicMock()
+    provider.name = "none"
+    provider.recall.return_value = []
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER), \
+         patch("pkms.querier.get_provider", return_value=provider), \
+         patch("pkms.querier.upsert"):
+        query("Q?", "alice", str(tmp_path), CONFIG,
+              session_id="arm_mem", use_memory=True, prior_context=None)
+
+    provider.recall.assert_called_once()
+    provider.store.assert_called_once()
+
+
+def test_query_forwards_num_predict_when_configured(tmp_path):
+    """query.num_predict caps the output reservation (eval sets it); forwarded to
+    complete() only when present, so the product default is unchanged."""
+    _setup_vault(tmp_path)
+    captured = {}
+
+    def cap(agent, prompt, config, **kw):
+        captured.update(kw)
+        return LLM_ANSWER
+
+    cfg = {**CONFIG, "query": {**CONFIG["query"], "num_predict": 1536}}
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", side_effect=cap), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), patch("pkms.querier.upsert"):
+        query("Q?", "alice", str(tmp_path), cfg, session_id="np", prior_context=[])
+
+    assert captured.get("num_predict") == 1536
+
+
+def test_query_store_memory_false_recalls_but_does_not_store(tmp_path):
+    """F2 probe path: recall ON, store OFF — a probe must not write its own answer back
+    into memory (that contaminated the store and coupled runs)."""
+    _setup_vault(tmp_path)
+    provider = MagicMock()
+    provider.name = "none"
+    provider.recall.return_value = []
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER), \
+         patch("pkms.querier.get_provider", return_value=provider), patch("pkms.querier.upsert"):
+        query("Q?", "alice", str(tmp_path), CONFIG, session_id="s",
+              use_memory=True, store_memory=False, prior_context=None)
+
+    provider.recall.assert_called_once()      # recall still happens
+    provider.store.assert_not_called()        # but the probe does NOT store
+
+
+def test_query_write_output_false_returns_none(tmp_path):
+    """write_output=False skips the per-turn output artifact (no file, no upsert)."""
+    _setup_vault(tmp_path)
+    upsert = MagicMock()
+    with patch("pkms.querier.embed", return_value=[0.1, 0.2, 0.3, 0.4]), \
+         patch("pkms.querier.search", side_effect=[WIKI_HITS, RAW_HITS]), \
+         patch("pkms.querier.complete", return_value=LLM_ANSWER), \
+         patch("pkms.querier._mem0_recall", return_value=[]), \
+         patch("pkms.querier._mem0_store"), \
+         patch("pkms.querier.upsert", upsert):
+        result = query("Q?", "alice", str(tmp_path), CONFIG,
+                       session_id="no_out", write_output=False, prior_context=[])
+
+    assert result["output_path"] is None
+    assert list((tmp_path / "vault" / "default" / "outputs").glob("no_out_*.md")) == []
+    assert upsert.call_count == 0
 
 
 # ── managed Mem0 client (app.mem0.ai) ─────────────────────────────────────────

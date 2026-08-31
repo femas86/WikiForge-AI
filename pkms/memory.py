@@ -1,4 +1,4 @@
-"""Pluggable agentic-memory providers for the Querier.
+"""Pluggable long-term memory providers for the Querier.
 
 The Querier's long-term memory is selected via `memory.provider` in
 pkms.config.yaml, so the backend is pluggable. Each provider implements the same
@@ -6,13 +6,10 @@ recall/store contract; recall returns plain strings injected into the synthesis
 prompt — a deliberately uniform, lowest-common-denominator interface so any
 memory backend can be swapped in without touching the Querier.
 
-Wave 1 providers (light / local / cheap): none (baseline), mem0 (managed
-fact-extraction), amem (local Zettelkasten). MemPalace (spatial / zero-LLM-write)
-is planned for Wave 1 too but pending API verification. Wave 2 (graph/temporal +
-memory-as-OS: Zep, Cognee, Letta) is deferred — see docs/agentic_memory_eval_design.md.
-
-Default is **none** (a no-op baseline). Providers lazy-import their backends so
-unused SDKs are never required.
+Available providers: `none` (no memory, the default), `mem0` (managed
+fact-extraction), `amem` (local note-linking over SQLite), `mempalace` (local
+spatial store). Providers lazy-import their backends so unused SDKs are never
+required.
 """
 
 from __future__ import annotations
@@ -60,7 +57,7 @@ class MemoryProvider(Protocol):
 
 
 class NoneProvider:
-    """Baseline: no memory. Recall is always empty, store is a no-op."""
+    """No memory: recall is always empty, store is a no-op (the default)."""
 
     name = "none"
     healthy = True
@@ -103,11 +100,11 @@ class Mem0Provider:
 
 
 class AMemProvider:
-    """A-MEM: Zettelkasten / note-linking paradigm (local SQLite implementation).
+    """A-MEM: note-linking memory (local SQLite implementation).
 
-    Each interaction is a "zettel" (note + embedding); on store, links are formed
-    to existing notes above a similarity threshold; on recall, the best-matching
-    note plus its 1-hop linked neighbours are returned.
+    Each interaction is stored as a note (text + embedding); on store, links are
+    formed to existing notes above a similarity threshold; on recall, the
+    best-matching note plus its 1-hop linked neighbours are returned.
     """
 
     name = "amem"
@@ -232,12 +229,12 @@ class AMemProvider:
 
 
 class MemPalaceProvider:
-    """MemPalace: spatial / method-of-loci, verbatim **zero-LLM-write** memory.
+    """MemPalace: local spatial memory (no LLM at write time).
 
     Each interaction is stored as a "drawer" (wing=user_id, room="qa"); recall is
     hybrid vector+BM25 search scoped to the user's wing. Uses MemPalace's own
     ChromaDB embedder (all-MiniLM-L6-v2). Heavy optional dependency — install with
-    `pip install '.[mempalace]'`. See docs/mempalace_sdk.md.
+    `pip install '.[mempalace]'`.
     """
 
     name = "mempalace"
@@ -289,12 +286,11 @@ _PROVIDERS: dict[str, type] = {
     "mem0": Mem0Provider,
     "amem": AMemProvider,
     "mempalace": MemPalaceProvider,
-    # Wave 2 (deferred): zep, cognee, letta — see docs/agentic_memory_eval_design.md
 }
 
 
 def get_provider(config: dict[str, Any]) -> MemoryProvider:
-    """Build the configured memory provider. Defaults to 'none' (baseline).
+    """Build the configured memory provider. Defaults to 'none' (no memory).
 
     Preconditions are validated in the provider constructor: an unhealthy
     provider logs one loud error there and degrades to no-op recall/store.

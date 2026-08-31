@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -13,6 +14,78 @@ logger = logging.getLogger(__name__)
 
 class LLMError(Exception):
     pass
+
+
+class LLMQuotaExhausted(LLMError):
+    """A DAILY quota (RPD/TPD) is exhausted, not a per-minute (RPM/TPM) blip: the
+    reset is far in the future, so retrying is futile. Raised so callers (the F2 eval)
+    can ABORT the run cleanly instead of grinding a long 429 wait into every probe."""
+
+
+# ── Groq rate-limit awareness (strategy A+B, see docs/f2_harness_design.md) ────────
+# Groq returns per-request headers: x-ratelimit-{limit,remaining,reset}-{requests,tokens}
+# — requests = RPD (daily), tokens = TPM (per-minute). We remember the last-seen TPM
+# state per model to PACE proactively (avoid the 429 at all), and read retry-after /
+# remaining-requests on a 429 to tell a per-minute blip (wait, capped) from a daily
+# exhaustion (abort). Pacing is opt-in via llm_router.groq_pace (the eval sets it).
+_GROQ_RATE: dict[str, dict[str, float]] = {}
+# Two DIFFERENT thresholds (learned from live Groq Free-tier 429s):
+#  - pacing may proactively sleep up to this to wait out a per-minute TPM window.
+#    Groq's TPM backoff can be ~120s under sustained overage, so this must exceed it.
+_PACE_WAIT_CAP_S = 180.0
+#  - a 429 is treated as a DAILY (RPD/TPD) exhaustion only when requests are actually
+#    gone OR the server asks to wait this long. 120s is a NORMAL per-minute backoff —
+#    NOT daily — so the daily threshold sits well above it.
+_DAILY_RETRY_AFTER_S = 600.0
+
+
+def _parse_duration(v: str | None) -> float | None:
+    """Groq reset headers look like '1h26m24s', '37m26.4s', '90ms', '2m59.56s'.
+    Return seconds, or None if unparseable."""
+    if not v:
+        return None
+    s = str(v).strip()
+    try:                                  # plain seconds (retry-after is numeric)
+        return float(s)
+    except ValueError:
+        pass
+    total, matched = 0.0, False
+    for value, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(ms|h|m|s)", s):
+        matched = True
+        f = float(value)
+        total += {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}[unit] * f
+    return total if matched else None
+
+
+def _note_groq_headers(model_id: str, headers: Any) -> None:
+    """Remember this model's TPM state (remaining tokens + when the minute resets)."""
+    try:
+        rem = headers.get("x-ratelimit-remaining-tokens")
+        if rem is None:
+            return
+        reset = _parse_duration(headers.get("x-ratelimit-reset-tokens")) or 0.0
+        rem_req = headers.get("x-ratelimit-remaining-requests")
+        _GROQ_RATE[model_id] = {
+            "rem_tokens": float(rem),
+            "reset_at": time.monotonic() + reset,
+            "rem_requests": float(rem_req) if rem_req is not None else -1.0,
+        }
+    except Exception:                     # header shape drift must never break a call
+        pass
+
+
+def _groq_pace(model_id: str, est_tokens: int) -> None:
+    """Strategy A: if the last response said the per-minute token budget can't fit this
+    call, sleep until it resets (capped) BEFORE calling — turning a 429+retry into a
+    quiet wait."""
+    st = _GROQ_RATE.get(model_id)
+    if not st or st["rem_tokens"] >= est_tokens:
+        return
+    wait = st["reset_at"] - time.monotonic()
+    if 0 < wait <= _PACE_WAIT_CAP_S:
+        logger.info("Groq %s: pacing %.1fs (TPM remaining %.0f < ~%d needed)",
+                    model_id, wait, st["rem_tokens"], est_tokens)
+        time.sleep(wait)
 
 
 def _retry_after_seconds(exc: Exception) -> float | None:
@@ -153,14 +226,44 @@ def _call_groq(prompt: str, system: str | None, config: dict[str, Any],
     if "qwen3.6" in model_id:
         payload["reasoning_effort"] = "none"
         payload["reasoning_format"] = "hidden"
+    elif "gpt-oss" in model_id:
+        # gpt-oss is a reasoning model: its hidden reasoning eats the output budget
+        # before the answer, so a small max_tokens with response_format=json_object
+        # yields a 400 json_validate_failed (the JSON never gets emitted). 'medium'
+        # keeps the reasoning bounded (~240 completion tokens) so a modest cap still
+        # produces a complete answer, while giving the judge more grading depth than
+        # 'low'. (gpt-oss rejects 'none' — only low/medium/high are valid.)
+        payload["reasoning_effort"] = "medium"
     timeout = config.get("groq", {}).get("timeout_seconds", 120)
+    if config.get("llm_router", {}).get("groq_pace"):
+        est = (len(prompt) + len(system or "")) // 4 + min(num_predict or 512, 1024)
+        _groq_pace(model_id, est)
     t0 = time.perf_counter()
-    body = _post_json(
+    resp = httpx.post(
         "https://api.groq.com/openai/v1/chat/completions",
-        payload,
-        timeout,
-        headers={"Authorization": f"Bearer {api_key}"},
+        json=payload, headers={"Authorization": f"Bearer {api_key}"}, timeout=timeout,
     )
+    _note_groq_headers(model_id, resp.headers)   # strategy A: remember TPM state
+    if resp.status_code == 429:
+        # strategy B: a per-minute (TPM/RPM) blip has a short retry-after and requests
+        # left → let retry_transient wait (capped) + retry. A daily (RPD/TPD) exhaustion
+        # has a long retry-after and/or zero remaining requests → abort, don't grind.
+        ra = _parse_duration(resp.headers.get("retry-after"))
+        try:
+            rem_req = float(resp.headers.get("x-ratelimit-remaining-requests"))
+        except (TypeError, ValueError):
+            rem_req = None
+        if (rem_req is not None and rem_req <= 0) or (ra is not None and ra >= _DAILY_RETRY_AFTER_S):
+            raise LLMQuotaExhausted(
+                f"Groq daily quota exhausted for {model_id} "
+                f"(retry-after={ra}s, remaining-requests={rem_req})"
+            )
+    if resp.status_code >= 400:
+        # surface Groq's error body (e.g. json_validate_failed) — raise_for_status alone
+        # gives an opaque HTTPStatusError with no reason
+        logger.warning("Groq %s HTTP %d: %s", model_id, resp.status_code, (resp.text or "")[:300])
+    resp.raise_for_status()
+    body = resp.json()
     usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
     metrics.record(
         "llm_call", backend="groq", model=model_id,
@@ -282,7 +385,7 @@ def complete(
     temperature: float | None = None,
     model: str | None = None,
     num_predict: int | None = None,
-    retries: int = 3,
+    retries: int | None = None,
     response_format: str | None = None,
 ) -> str:
     """Route a completion request to the configured backend for agent.
@@ -293,14 +396,26 @@ def complete(
     response_format: e.g. "json" — Ollama-only output constraint; Claude ignores it
     (it honours the JSON instruction in the prompt), so it's safe on the fallback too.
     retries: attempts on the primary before falling back (fail-fast with retries=1).
-    Raises LLMError if both fail.
+    None → `llm_router.default_retries` (default 3); the F2 eval raises this for more
+    patience under Groq 429s.
+    Raises LLMError if both fail (or if the primary fails and `llm_router.disable_fallback`
+    is set — the F2 eval sets it so a rate-limited/​timed-out cloud call never silently
+    falls back to a local model and contaminates the measured answer).
     """
+    lr = config.get("llm_router") or {}
+    if retries is None:
+        retries = int(lr.get("default_retries", 3))
+    disable_fallback = bool(lr.get("disable_fallback"))
     primary = _backend_for_agent(agent, config)
     try:
         return _call_with_retry(primary, prompt, system, config, retries=retries,
                                 temperature=temperature, model=model, num_predict=num_predict,
                                 response_format=response_format)
     except Exception as primary_exc:
+        # A daily-quota exhaustion is not fixable by a fallback or a retry — propagate
+        # it as itself so the eval can abort the run cleanly (strategy B).
+        if isinstance(primary_exc, LLMQuotaExhausted):
+            raise
         # Billing/credit exhaustion is not something a local fallback can fix — it
         # would hallucinate or time out and saturate the machine. Fail fast and loud
         # so the caller (and the user) sees the real cause instead of silent junk.
@@ -313,6 +428,11 @@ def complete(
         # error): re-raise as itself instead of masking it behind the fallback.
         if not _is_backend_error(primary_exc):
             raise
+        if disable_fallback:
+            raise LLMError(
+                f"Backend '{primary}' failed and fallback is disabled "
+                "(llm_router.disable_fallback)"
+            ) from primary_exc
         fallback = _fallback_for(primary, config)
         if fallback is None:
             raise LLMError(

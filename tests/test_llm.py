@@ -321,6 +321,8 @@ def test_credit_error_fails_fast_no_retry_no_fallback():
 
 def _groq_resp(text):
     r = MagicMock()
+    r.status_code = 200
+    r.headers = {}
     r.json.return_value = {"choices": [{"message": {"content": text}}]}
     r.raise_for_status = MagicMock()
     return r
@@ -341,12 +343,14 @@ def test_call_groq_forces_non_thinking_for_qwen36():
 
 def test_call_groq_omits_reasoning_for_other_models():
     from pkms.llm import _call_groq
-    cfg = {"llm_router": {"models": {"groq": "openai/gpt-oss-120b"}}}
+    cfg = {"llm_router": {"models": {"groq": "llama-3.3-70b-versatile"}}}
     with patch.dict(os.environ, {"GROQ_API_KEY": "gk-test"}), \
          patch("pkms.llm.httpx.post", return_value=_groq_resp("ok")) as mp:
         _call_groq("prompt", None, cfg)
     body = mp.call_args.kwargs["json"]
-    assert "reasoning_effort" not in body           # gated on qwen3.6 only
+    # reasoning params are added only for qwen3.6 (none/hidden) and gpt-oss (medium);
+    # a plain model gets neither
+    assert "reasoning_effort" not in body and "reasoning_format" not in body
     assert "reasoning_format" not in body
 
 
@@ -390,6 +394,107 @@ def test_complete_groq_falls_back_to_ollama():
          patch("pkms.llm.time.sleep"):
         out = complete("compiler", "prompt", GROQ_CFG)
     assert out == "ollama fallback"
+
+
+from pkms.llm import LLMQuotaExhausted, _call_groq, _parse_duration
+
+_GROQ_MODEL_CFG = {"llm_router": {"models": {"groq": "qwen/qwen3.6-27b"}}, "groq": {}}
+
+
+def _groq_response(status, headers, body=None):
+    r = MagicMock()
+    r.status_code = status
+    r.headers = headers
+    r.json.return_value = body or {"choices": [{"message": {"content": "ok"}}], "usage": {}}
+    if status >= 400:
+        r.raise_for_status.side_effect = _http_status_error(status)
+    else:
+        r.raise_for_status.return_value = None
+    return r
+
+
+def test_parse_duration_forms():
+    assert abs(_parse_duration("1h26m24s") - (3600 + 26 * 60 + 24)) < 1e-6
+    assert abs(_parse_duration("37m26.4s") - (37 * 60 + 26.4)) < 1e-6
+    assert abs(_parse_duration("90ms") - 0.09) < 1e-9
+    assert _parse_duration("7") == 7.0          # plain seconds (retry-after)
+    assert _parse_duration("junk") is None and _parse_duration(None) is None
+
+
+def test_call_groq_daily_quota_raises_exhausted():
+    # long retry-after + zero remaining requests = daily (RPD/TPD) exhaustion → abort
+    resp = _groq_response(429, {"retry-after": "3600", "x-ratelimit-remaining-requests": "0",
+                                "x-ratelimit-remaining-tokens": "0", "x-ratelimit-reset-tokens": "1s"})
+    with patch.dict(os.environ, {"GROQ_API_KEY": "gk"}), \
+         patch("pkms.llm.httpx.post", return_value=resp):
+        with pytest.raises(LLMQuotaExhausted):
+            _call_groq("p", None, _GROQ_MODEL_CFG)
+
+
+def test_call_groq_minute_blip_stays_transient():
+    # short retry-after + requests remaining = per-minute TPM blip → normal 429 (retryable)
+    resp = _groq_response(429, {"retry-after": "5", "x-ratelimit-remaining-requests": "900",
+                                "x-ratelimit-remaining-tokens": "0", "x-ratelimit-reset-tokens": "3s"})
+    with patch.dict(os.environ, {"GROQ_API_KEY": "gk"}), \
+         patch("pkms.llm.httpx.post", return_value=resp):
+        with pytest.raises(httpx.HTTPStatusError):
+            _call_groq("p", None, _GROQ_MODEL_CFG)
+
+
+def test_call_groq_gpt_oss_sets_reasoning_effort_medium():
+    # gpt-oss reasoning eats the output budget → we bound it so a small cap still emits
+    # valid JSON (avoids 400 json_validate_failed)
+    captured = {}
+
+    def router(url, json=None, **kw):
+        captured.update(json or {})
+        return _groq_response(200, {}, {"choices": [{"message": {"content": "ok"}}], "usage": {}})
+
+    with patch.dict(os.environ, {"GROQ_API_KEY": "gk"}), \
+         patch("pkms.llm.httpx.post", side_effect=router):
+        _call_groq("p", None, {"llm_router": {"models": {"groq": "openai/gpt-oss-120b"}}, "groq": {}})
+    assert captured.get("reasoning_effort") == "medium"
+
+
+def test_call_groq_120s_tpm_backoff_is_not_daily():
+    # 120s retry-after is Groq's per-minute TPM backoff when requests are still available —
+    # it must stay a retryable 429, NOT be misread as a daily-quota abort (regression).
+    resp = _groq_response(429, {"retry-after": "120", "x-ratelimit-remaining-requests": "870",
+                                "x-ratelimit-remaining-tokens": "0", "x-ratelimit-reset-tokens": "2m"})
+    with patch.dict(os.environ, {"GROQ_API_KEY": "gk"}), \
+         patch("pkms.llm.httpx.post", return_value=resp):
+        with pytest.raises(httpx.HTTPStatusError):
+            _call_groq("p", None, _GROQ_MODEL_CFG)
+
+
+def test_complete_propagates_quota_exhausted_even_with_fallback():
+    # a daily exhaustion must NOT be masked by the fallback path — it propagates as itself
+    resp = _groq_response(429, {"retry-after": "7200", "x-ratelimit-remaining-requests": "0"})
+    with patch.dict(os.environ, {"GROQ_API_KEY": "gk"}), \
+         patch("pkms.llm.httpx.post", return_value=resp), patch("pkms.llm.time.sleep"):
+        with pytest.raises(LLMQuotaExhausted):
+            complete("compiler", "p", GROQ_CFG)
+
+
+def test_complete_disable_fallback_raises_instead_of_falling_back():
+    """F2 eval sets llm_router.disable_fallback so a failed cloud call never silently
+    runs on the local model — it raises LLMError (the harness records an 'error' probe)."""
+    import copy as _copy
+    cfg = _copy.deepcopy(GROQ_CFG)
+    cfg["llm_router"]["disable_fallback"] = True
+
+    def router(url, **kw):
+        if "api.groq.com" in url:
+            raise _http_status_error(500, url=url)
+        r = MagicMock()
+        r.json.return_value = {"response": "ollama fallback"}
+        r.raise_for_status = MagicMock()
+        return r
+    with patch.dict(os.environ, {"GROQ_API_KEY": "gk-test"}), \
+         patch("pkms.llm.httpx.post", side_effect=router), \
+         patch("pkms.llm.time.sleep"):
+        with pytest.raises(LLMError, match="fallback is disabled"):
+            complete("compiler", "prompt", cfg)
 
 
 # ── Retry-After honouring (429/503 rate limits) ───────────────────────────────
