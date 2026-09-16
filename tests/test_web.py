@@ -67,7 +67,8 @@ def test_query_happy_path(tmp_path):
     with _override(get_vault_root, lambda: str(tmp_path)), \
          _override(get_config, lambda: CFG), \
          patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
-        resp = CLIENT.post("/query", json={"text": "What are transformers?", "user_id": "alice"})
+        resp = CLIENT.post("/query", json={"text": "What are transformers?",
+                                           "user_id": "alice", "session_id": "ses-42"})
 
     assert resp.status_code == 200
     body = resp.json()
@@ -75,26 +76,10 @@ def test_query_happy_path(tmp_path):
     assert body["coverage"] == "full"
     assert body["sources"] == ["vault/wiki/articles/transformers.md"]
     mock_q.assert_called_once()
-
-
-def test_query_passes_user_id(tmp_path):
-    with _override(get_vault_root, lambda: str(tmp_path)), \
-         _override(get_config, lambda: CFG), \
-         patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
-        CLIENT.post("/query", json={"text": "Q?", "user_id": "bob"})
-
+    # the route forwards identity + session straight through to the handler (dropping
+    # session_id would silently break per-session working memory)
     call_kwargs = mock_q.call_args[1]
-    assert call_kwargs["user_id"] == "bob"
-
-
-def test_query_passes_session_id(tmp_path):
-    with _override(get_vault_root, lambda: str(tmp_path)), \
-         _override(get_config, lambda: CFG), \
-         patch("pkms.web.handle_query", return_value=QUERY_RESULT) as mock_q:
-        CLIENT.post("/query", json={"text": "Q?", "user_id": "a", "session_id": "ses-42"})
-
-    call_kwargs = mock_q.call_args[1]
-    assert call_kwargs["session_id"] == "ses-42"
+    assert call_kwargs["user_id"] == "alice" and call_kwargs["session_id"] == "ses-42"
 
 
 def test_query_empty_text_returns_422(tmp_path):

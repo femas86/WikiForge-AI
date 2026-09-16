@@ -25,15 +25,8 @@ CONFIG = {
 
 # ── _extract_wiki_links ───────────────────────────────────────────────────────
 
-def test_extract_simple_link():
-    assert _extract_wiki_links("See [[transformers]] for details.") == ["transformers"]
-
-
-def test_extract_link_with_anchor():
-    assert _extract_wiki_links("Read [[transformers|the article]].") == ["transformers"]
-
-
 def test_extract_multiple_links():
+    # covers both bare links ([[a]], [[c]]) and anchor stripping ([[b|B text]] → "b")
     result = _extract_wiki_links("[[a]] and [[b|B text]] and [[c]]")
     assert result == ["a", "b", "c"]
 

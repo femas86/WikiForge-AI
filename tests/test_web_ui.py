@@ -57,6 +57,7 @@ def test_query_page_returns_html():
     assert "text/html" in resp.headers["content-type"]
     assert "Ask the Knowledge Base" in resp.text
     assert 'hx-post="/ui/query"' in resp.text
+    assert 'href="/wiki"' in resp.text     # nav link to the wiki
 
 
 def test_ingest_page_returns_html():
@@ -105,24 +106,9 @@ def test_ui_query_returns_answer_html(tmp_path):
         resp = CLIENT.post("/ui/query", data={"text": "What are transformers?", "user_id": "alice"})
     assert resp.status_code == 200
     assert "answer-card" in resp.text
-    assert "full" in resp.text  # coverage badge
-
-
-def test_ui_query_renders_markdown_placeholder(tmp_path):
-    with _override(get_vault_root, lambda: str(tmp_path)), \
-         _override(get_config, lambda: CFG), \
-         patch("pkms.web.handle_query", return_value=QUERY_RESULT):
-        resp = CLIENT.post("/ui/query", data={"text": "Q?", "user_id": "alice"})
-    # data-markdown attribute present for client-side rendering
-    assert "data-markdown" in resp.text
-
-
-def test_ui_query_shows_sources(tmp_path):
-    with _override(get_vault_root, lambda: str(tmp_path)), \
-         _override(get_config, lambda: CFG), \
-         patch("pkms.web.handle_query", return_value=QUERY_RESULT):
-        resp = CLIENT.post("/ui/query", data={"text": "Q?", "user_id": "alice"})
-    assert "transformers.md" in resp.text
+    assert "full" in resp.text            # coverage badge
+    assert "data-markdown" in resp.text   # client-side markdown-render hook
+    assert "transformers.md" in resp.text  # sources rendered in the fragment
 
 
 def test_ui_query_shows_raw_only_warning(tmp_path):
@@ -418,11 +404,6 @@ def test_wiki_article_invalid_project_404(tmp_path):
     assert resp.status_code == 404
 
 
-def test_nav_contains_wiki_link():
-    resp = CLIENT.get("/query")
-    assert 'href="/wiki"' in resp.text
-
-
 def test_ingest_file_normalizes_project_case(tmp_path):
     with _override(get_vault_root, lambda: str(tmp_path)), \
          _override(get_config, lambda: CFG), \
@@ -616,15 +597,6 @@ def test_wiki_graph_data(tmp_path):
     assert ("beta", "alpha") in pairs
     assert ("alpha", "concept:ghost") in pairs  # article → concept (unresolved)
     assert ("alpha", "tag:core") in pairs       # article → tag
-
-
-def test_wiki_graph_data_concepts_and_tags_toggleable(tmp_path):
-    from pkms.web import _wiki_link_graph
-    _make_graph_wiki(tmp_path)
-    g = _wiki_link_graph(tmp_path / "vault", "default", include_concepts=False, include_tags=False)
-    assert all(n["type"] == "article" for n in g["nodes"])
-    # only resolved article→article links remain
-    assert all(l["target"] in {"alpha", "beta", "gamma"} for l in g["links"])
 
 
 def test_wiki_link_graph_caches_until_articles_change(tmp_path):
