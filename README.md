@@ -44,8 +44,11 @@ generato automaticamente dai `[[wikilink]]` compilati.*
 - **Provenance + audit.** Ogni articolo dichiara le fonti; rimuovere una fonte ne pulisce
   wiki, indice, vettori e link entranti. Un linter opzionale usa un LLM per segnalare
   contraddizioni, incoerenze e articoli-stub.
+- **Formato aperto.** La wiki è già Markdown + frontmatter versionato in git; `pkms
+  export-okf` ne produce un bundle nell'[Open Knowledge Format](https://cloud.google.com/blog/products/data-analytics/how-the-open-knowledge-format-can-improve-data-sharing)
+  (OKF v0.1), consumabile da qualsiasi strumento conforme, senza toccare il formato nativo.
 - **Zero framework agentici.** Pipeline + blackboard + locking su primitive standard
-  (FastAPI, httpx, qdrant-client, SQLite). ~5.700 righe di Python, oltre 400 test.
+  (FastAPI, httpx, qdrant-client, SQLite). ~5.700 righe di Python, oltre 500 test.
 
 ---
 
@@ -54,6 +57,11 @@ generato automaticamente dai `[[wikilink]]` compilati.*
 - Python 3.12+ e [uv](https://docs.astral.sh/uv/)
 - Docker + Docker Compose (per Qdrant e Ollama)
 - ~32 GB RAM consigliati per i modelli locali quantizzati (CPU-only supportato)
+- La porta **11434 dev'essere libera** per il container Ollama: se hai un Ollama
+  nativo sull'host, fermalo prima (`sudo systemctl stop ollama`)
+- Al primo avvio `docker compose` scarica tre modelli (`mistral:7b`,
+  `nomic-embed-text`, `llama3.2:1b`): un pull a freddo può richiedere qualche minuto,
+  e `scripts/start.sh` li attende prima di servire la UI
 - (Opzionale) una API key per un backend LLM cloud — vedi **Configurare il provider LLM**
 
 ## Avvio rapido
@@ -179,8 +187,28 @@ provider mal configurato lo dichiara con un errore, non degrada in silenzio.
 
 - **Web UI** (FastAPI + HTMX): query, ingest (con stream di avanzamento live via SSE),
   browser della wiki con backlink, filtro per tag e **grafo dei link** navigabile,
-  impostazioni per-utente, "trasforma una risposta in nota".
-- **CLI**: `pkms ingest | compile | query | lint | watch | serve`, con `--project`.
+  impostazioni per-utente, "trasforma una risposta in nota". Servita su
+  `http://localhost:8000` da `pkms serve` (o da `scripts/start.sh`); pagine principali:
+  `/query`, `/ingest`, `/wiki`, `/wiki/graph`, `/settings`, `/members`. L'autenticazione
+  multi-utente è fornita dal proxy davanti all'app (header `X-Auth-User`).
+- **CLI** — `--project <nome>` è accettato su ogni verbo (default `default`). Il comando
+  `pkms` è installato nel venv (`.venv/bin`): attiva il venv (`source .venv/bin/activate`)
+  o prefissa con `uv run` (`uv run pkms …`). Aiuto completo: `pkms <verbo> --help`.
+
+  | Comando | Cosa fa | Opzioni principali |
+  |---|---|---|
+  | `pkms ingest <path\|url>` | Ingerisce un file o un URL `http(s)://` → parsing → chunk → embed → Qdrant. | `--force` (re-embed anche se l'hash del contenuto è invariato) |
+  | `pkms compile` | Compila i documenti grezzi in articoli wiki (commit nel repo git del vault). | `--doc <path>` \| `--topic <t>` (scope mutuamente esclusivo; ometti entrambi per l'intero progetto) |
+  | `pkms query "<domanda>"` | Ricerca duale (wiki + fonti) → risposta citata con livello di copertura. | `--user <id>` (identità per il recall della memoria a lungo termine) |
+  | `pkms lint` | Controlli regola-based sulla wiki (deriva, link rotti, orfani, frontmatter); scrive un report. | `--semantic` (aggiunge l'audit LLM opzionale — costa chiamate LLM) |
+  | `pkms reindex` | Forza la re-ingest di **tutti** i doc grezzi del progetto e ricompila la wiki da zero. | `--project` |
+  | `pkms remove <path-raw>` | Rimuove un documento da ogni superficie (vettori raw+wiki, indice, provenienza, link entranti). | positional = path raw relativo al vault |
+  | `pkms export-okf` | Esporta la wiki nell'Open Knowledge Format (OKF v0.1). | `--out <dir>` (default sotto il progetto) |
+  | `pkms watch` | Avvia il watcher debounced a singolo worker sui `raw/` del vault (auto-ingest + reconcile). | — |
+  | `pkms serve` | Avvia l'API/UI web **da sola** (senza watcher/container). | `--host` (default `$PKMS_HOST` o `0.0.0.0`), `--port` (default `$PKMS_PORT` o `8000`), `--reload` |
+  | `pkms member <add\|remove\|list>` | Gestisce membri e ruoli del progetto (admin fidato-locale). | `add <utente> --role <owner\|editor\|viewer>`, `remove <utente>`, `list` |
+
+  I test si eseguono con `uv run pytest` (vedi [Test](#test)), **non** è un verbo `pkms`.
 
 | Interroga | Ingest |
 |---|---|
@@ -201,7 +229,7 @@ primaria.
 
 ```
 pkms/
-├── web.py           # FastAPI + UI (query, ingest SSE, wiki browser + grafo)
+├── web/             # FastAPI + UI (ui.py, api.py, jobs SSE) — query, ingest, wiki + grafo
 ├── compiler.py      # articoli wiki dai chunk, cross-link, map-reduce
 ├── coordinator.py   # orchestrazione, lock, CLI
 ├── ingestor.py      # parsing, chunking semantico, dedup a doppio hash
@@ -209,6 +237,7 @@ pkms/
 ├── linter.py        # audit qualità wiki (read-only)
 ├── llm.py           # router 3-backend (claude/ollama/groq) + retry
 ├── memory.py        # provider di memoria pluggable
+├── okf_export.py    # export della wiki in Open Knowledge Format (OKF v0.1)
 ├── embed.py         # embedding Ollama batch
 ├── qdrant_store.py  # store vettoriale
 ├── db.py            # SQLite: file, provenance, migrazioni
@@ -220,8 +249,14 @@ pkms/
 
 ## Test
 
+Nessun servizio attivo è richiesto: Qdrant, Ollama e i backend LLM sono mockati,
+quindi la suite gira offline.
+
 ```bash
-uv run pytest
+uv run pytest -q                     # suite completa (oltre 500 test)
+uv run pytest --collect-only -q      # elenca i test senza eseguirli
+uv run pytest tests/test_querier.py  # un singolo file
+uv run pytest -k "compile" -x        # seleziona per espressione, stop al primo fallimento
 ```
 
 ## Licenza
