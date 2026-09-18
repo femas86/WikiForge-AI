@@ -1,6 +1,9 @@
 [project]
 name = "pkms"
 version = "0.1.0"
+description = "TKMs: multi-agent compiler from raw documents to a git-versioned Markdown wiki, with pluggable agentic memory"
+readme = "README.md"
+authors = [{name = "Federico Mastrorilli"}]
 requires-python = ">=3.11"
 
 dependencies = [
@@ -19,6 +22,8 @@ dependencies = [
   "httpx",
   "python-multipart",
   "jinja2",
+  "markupsafe",
+  "pydantic",
   "python-dotenv>=1.2.2",
   "numpy",          # A-MEM provider: cosine similarity over local zettel embeddings
 ]
