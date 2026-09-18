@@ -24,6 +24,7 @@ def _build_scope(args: argparse.Namespace) -> dict[str, Any]:
 from pkms.compiler import compile as run_compile
 from pkms.compiler import (
     _get_uncompiled_raw_paths,
+    _git_commit,
     _git_commit_paths,
     _project_of,
     _rebuild_index,
@@ -214,6 +215,17 @@ def _write_ingest_result(result: dict[str, Any], vault_root: str, db_path: str) 
         project=result.get("project", "default"),
         content_hash=result.get("content_hash", ""),
     )
+    # Audit trail (§5.1): commit the raw document to the vault's git repo, so the team
+    # can verify what the vault held at any point — not only the compiled articles.
+    # Deliberately AFTER the index write: the index row is the completion marker and
+    # the source of truth; git is the trail. _git_commit is non-fatal (warns, never
+    # raises) and no-ops when nothing changed, so a forced re-ingest of unchanged
+    # bytes stays idempotent here too. Before this, raw only reached git as a side
+    # effect of an un-ingest's `git add -A` (or by hand).
+    project = result.get("project", "default")
+    rel_path = str(Path(result["path"]).relative_to("vault"))
+    _git_commit(_vault_dir(vault_root), [rel_path],
+                f"ingest: {Path(result['path']).name} ({project})")
 
 
 # ── verb handlers ─────────────────────────────────────────────────────────────

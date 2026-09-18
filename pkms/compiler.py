@@ -775,7 +775,12 @@ def _git_commit(vault_dir: Path, rel_paths: list[str], message: str) -> None:
         if not repo.head.is_valid():
             # Fresh repo: HEAD is unborn, diff("HEAD") would raise
             repo.index.commit(message)
-        elif repo.index.diff("HEAD") or repo.untracked_files:
+        elif repo.index.diff("HEAD"):
+            # Commit ONLY when the staged paths differ from HEAD. index.diff("HEAD")
+            # already reports newly added files, so the former `or repo.untracked_files`
+            # was redundant for its purpose and harmful: it fired an EMPTY commit
+            # whenever ANY unrelated untracked file sat in the vault — one per document
+            # on a forced reindex of unchanged sources.
             repo.index.commit(message)
     except Exception as exc:
         logger.warning("Git commit failed: %s", exc)

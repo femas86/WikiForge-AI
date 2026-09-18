@@ -50,7 +50,7 @@ def test_write_ingest_result_stores_file(tmp_path):
     db = str(vault / "vault" / ".search-index")
     init_db(db)
 
-    with patch("pkms.coordinator.guard_write"):
+    with patch("pkms.coordinator.guard_write"), patch("pkms.coordinator._git_commit"):
         _write_ingest_result(INGEST_RESULT, str(vault), db)
 
     row = get_file(db, "vault/raw/doc.pdf")
@@ -64,11 +64,31 @@ def test_write_ingest_result_calls_guard_write(tmp_path):
     db = str(vault / "vault" / ".search-index")
     init_db(db)
 
-    with patch("pkms.coordinator.guard_write") as mock_guard:
+    with patch("pkms.coordinator.guard_write") as mock_guard, \
+         patch("pkms.coordinator._git_commit"):
         _write_ingest_result(INGEST_RESULT, str(vault), db)
 
     mock_guard.assert_called_once()
     assert mock_guard.call_args[0][0] == "coordinator"
+
+
+def test_write_ingest_result_commits_raw_to_vault_git(tmp_path):
+    """Raw documents are committed AT INGEST (audit trail, §5.1) — not only the compiled
+    articles, and not merely swept in later by an un-ingest's `git add -A`."""
+    vault = tmp_path
+    (vault / "vault").mkdir()
+    db = str(vault / "vault" / ".search-index")
+    init_db(db)
+
+    with patch("pkms.coordinator.guard_write"), \
+         patch("pkms.coordinator._git_commit") as mock_commit:
+        _write_ingest_result({**INGEST_RESULT, "project": "og-mdai"}, str(vault), db)
+
+    mock_commit.assert_called_once()
+    vault_dir, rel_paths, message = mock_commit.call_args[0]
+    assert vault_dir == vault / "vault"
+    assert rel_paths == ["raw/doc.pdf"]            # vault-relative, like the compile commit
+    assert message == "ingest: doc.pdf (og-mdai)"
 
 
 # ── handle_ingest ─────────────────────────────────────────────────────────────

@@ -614,3 +614,35 @@ def test_compile_sectioned_dedupes_sources_deterministically():
                                            {"raw_path": "b.pdf"}], "", CONFIG, "t")
     # Sources section built from the sources arg (deterministic), not the LLM
     assert art.count("- a.pdf") == 1 and "- b.pdf" in art
+
+
+# ── _git_commit: commits only real changes, never an empty commit ──────────────
+
+def test_git_commit_skips_unchanged_paths_despite_stray_untracked_file(tmp_path):
+    """Regression: _git_commit used to fire an EMPTY commit whenever ANY untracked file
+    existed in the vault (`or repo.untracked_files`), even if the given paths were
+    unchanged — so a forced re-ingest/reindex with one stray file produced one empty
+    commit per document. It must commit only when the staged paths differ from HEAD.
+    Exercises the REAL helper on a real git repo (every other test mocks it)."""
+    import git
+    from pkms.compiler import _git_commit
+    vault = tmp_path / "vault"
+    (vault / "raw").mkdir(parents=True)
+    (vault / "raw" / "doc.txt").write_text("v1", encoding="utf-8")
+    repo = git.Repo.init(str(vault))
+    with repo.config_writer() as cw:                      # no dependency on the host's git identity
+        cw.set_value("user", "name", "test")
+        cw.set_value("user", "email", "test@example.invalid")
+
+    _git_commit(vault, ["raw/doc.txt"], "ingest: doc.txt")            # new file → commits
+    assert repo.head.is_valid()
+    assert repo.head.commit.message.startswith("ingest: doc.txt")
+    n1 = len(list(repo.iter_commits()))
+
+    (vault / "stray.tmp").write_text("x", encoding="utf-8")           # unrelated untracked file
+    _git_commit(vault, ["raw/doc.txt"], "ingest: doc.txt")            # path unchanged → NO commit
+    assert len(list(repo.iter_commits())) == n1
+
+    (vault / "raw" / "doc.txt").write_text("v2", encoding="utf-8")     # real change → commits
+    _git_commit(vault, ["raw/doc.txt"], "ingest: doc.txt v2")
+    assert len(list(repo.iter_commits())) == n1 + 1
